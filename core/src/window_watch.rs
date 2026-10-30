@@ -303,7 +303,14 @@ fn drain_events() {
         };
         for evt in batch {
             match evt {
-                Evt::Destroyed(h) => crate::on_window_gone(h, "已销毁"),
+                // 先推进实例代次，再交给 on_window_gone。
+                // 顺序不能反：代次是「这个句柄值上已经不是原来那个窗口」的唯一依据，
+                // 销毁一发生就得记上 —— 等到后面某个新窗口占了这个句柄值，
+                // 身份校验才有东西可对比，光靠 IsWindow 看不到「中间没了一次」。
+                Evt::Destroyed(h) => {
+                    crate::window_id::note_instance_destroyed(h);
+                    crate::on_window_gone(h, "已销毁")
+                }
                 Evt::Hidden(h) => crate::on_window_gone(h, "已隐藏"),
                 Evt::Foreground(h) => crate::on_foreground_changed(h),
             }
@@ -392,6 +399,11 @@ unsafe extern "system" fn on_object_event(
         EVENT_OBJECT_HIDE => Evt::Hidden(hwnd_value),
         // 创建与显示只作观察：真正要处理的是「它是不是我们的目标窗口」，
         // 这件事在 start_sync 时已经定了，这里不需要抢着做。
+        //
+        // 特别注意：这里**故意不推进窗口实例代次**。代次只靠销毁推进就够 ——
+        // 「销毁」是实例结束的唯一确定信号，而创建事件会在重建流程、隐藏的辅助窗口、
+        // 消息框等地方反复冒出来；拿它推进，一个活得好好的窗口会被算成新一代，
+        // 身份校验就会把用户正在用的窗口无故判成「换了人」。
         EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW => return,
         _ => return,
     };

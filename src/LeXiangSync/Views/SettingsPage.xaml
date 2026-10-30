@@ -496,7 +496,7 @@
                             </Grid>
                         </Border>
 
-                        <Border Style="{StaticResource LxSettingRowLastStyle}">
+                        <Border Style="{StaticResource LxSettingRowStyle}">
                             <Grid ColumnSpacing="12">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
@@ -512,6 +512,22 @@
                                     SelectedIndex="{x:Bind ViewModel.ClipboardLimitIndex, Mode=OneWay}"
                                     ToolTipService.ToolTip="单次注入的字符上限，由同步核心固定" />
                             </Grid>
+                        </Border>
+
+                        <!--
+                            文本注入有两条能力完全不同的通道，用户有权知道现在走的是哪一条：
+                            标准输入框不需要抢前台，自绘控件和游戏只能靠切前台 + 模拟输入。
+                            把话说在前面，比事后解释「为什么我的窗口闪了一下」要好。
+                        -->
+                        <Border Style="{StaticResource LxSettingRowLastStyle}">
+                            <StackPanel Spacing="4">
+                                <TextBlock Style="{StaticResource LxSettingLabelStyle}" Text="文本注入通道" />
+                                <TextBlock
+                                    FontSize="{StaticResource LxFontCaption}"
+                                    Foreground="{ThemeResource LxTextTertiaryBrush}"
+                                    TextWrapping="Wrap"
+                                    Text="标准输入框（Edit / RichEdit / WinForms / Scintilla）走无焦点通道：直接投字符消息，不切换前台。自绘控件、WPF、Electron 与游戏没有这条路，只能短暂切换到从窗口用模拟输入，注入完自动把前台还回去。" />
+                            </StackPanel>
                         </Border>
                     </StackPanel>
                 </Border>

@@ -10,6 +10,12 @@
 //! 前两个防复用，第三个区分同名程序（同一份客户端放在两个目录里多开就是这种情况），
 //! 第四个区分窗口类型（同一进程的主窗口 / 子控件 / 输入法候选窗）。
 //!
+//! 但这四样还漏了一种最阴的复用：**同一个进程里，旧窗口销毁、新窗口创建，
+//! 系统把同一个 HWND 值又发下来**。五项全一样，`matches` 会说「还是它」，
+//! 于是继续往一个已经换人的窗口里投键鼠消息。要挡住这种，只能再引入一个
+//! 「实例代次」—— 它不看窗口长什么样，只看这个句柄值上发生过几次销毁，
+//! 见 [`WindowKey::generation`] 与 [`note_instance_destroyed`]。
+//!
 //! 除此之外，[`WindowIdentity`] 还带上了坐标映射和缩放要用的客户区尺寸与 DPI，
 //! 以及父窗口句柄 —— 排查「为什么这个窗口查不到」的时候，这几项基本是第一眼要看的东西。
 
@@ -89,10 +95,13 @@ impl WindowIdentity {
     /// 取稳定身份
     pub fn key(&self) -> WindowKey {
         WindowKey {
-            pid: self.pid,
-            process_start_time: self.process_start_time,
-            exe_path: self.exe_path.clone(),
+            process: ProcessKey {
+                pid: self.pid,
+                process_start_time: self.process_start_time,
+                exe_path: self.exe_path.clone(),
+            },
             class_name: self.class_name.clone(),
+            generation: instance_generation(self.hwnd),
         }
     }
 
@@ -111,19 +120,53 @@ impl WindowIdentity {
     }
 }
 
+/// 进程身份：`PID + 进程启动时间 + EXE 完整路径` 三件套。
+///
+/// 单独拆出来是因为它回答的问题和窗口实例无关：「这个进程还是原来那个进程吗」。
+/// PID 会被系统复用（关掉游戏再开别的程序可能撞号），所以必须配上启动时间；
+/// 同名程序放在两个目录里多开时 PID 和启动时间都不同，靠 EXE 路径再分一次。
+///
+/// 它只能防「换进程」，防不住同一进程内部的窗口重建 —— 那件事交给
+/// [`WindowKey::generation`]。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProcessKey {
+    pub pid: u32,
+    pub process_start_time: u64,
+    pub exe_path: String,
+}
+
 /// 窗口的稳定身份：句柄之外的那部分。
 ///
 /// 只在 `start_sync` 时采一次，之后用来回答一个问题：
 /// 「这个句柄现在指的，还是当初那个窗口吗？」
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WindowKey {
-    pub pid: u32,
-    pub process_start_time: u64,
-    pub exe_path: String,
+    /// 它属于哪个进程
+    pub process: ProcessKey,
+    /// 窗口类名。同一进程里主窗口 / 子控件 / 输入法候选窗靠它分开
     pub class_name: String,
+    /// 窗口实例代次：同一个 HWND 值上出现过几次「销毁 → 再出现」。
+    ///
+    /// 为什么非得有它：`pid + 启动时间 + 路径 + 类名` 全都相同、但窗口已经换人的
+    /// 情况是真实存在的 —— 同一进程里旧窗口 `DestroyWindow`，新窗口马上创建，
+    /// 系统把刚收回的 HWND 值又发了出去。前面四项一个字节都不会变，
+    /// 光看字段根本分不出「还是原来那个」和「同一个位置上的新窗口」。
+    ///
+    /// 代次不看窗口长什么样，只数这个句柄值上发生过几次销毁：
+    /// 它由 [`note_instance_destroyed`] 在收到销毁事件时推进。
+    /// 捕获时记下的是当时的值（通常是 0），只要窗口一直活着就不会变；
+    /// 一旦这个句柄值被销毁过，读出来的代次就比当初记的大，`matches` 立刻翻脸。
+    ///
+    /// 用销毁而不是创建来推进，是因为「销毁」是实例结束的唯一确定信号：
+    /// 创建事件会为隐藏的辅助窗口、重建过程中的临时窗口反复触发，
+    /// 拿它推进会把一个活得好好的窗口算成新一代。
+    pub generation: u64,
 }
 
 impl WindowKey {
+    /// 采一份身份。窗口已经没了返回 `None`。
+    ///
+    /// 代次从下面那张进程内的代次表里读，没有记录就是 0。
     pub fn of(hwnd: HWND) -> Option<Self> {
         if hwnd.0.is_null() || !unsafe { IsWindow(hwnd).as_bool() } {
             return None;
@@ -134,10 +177,13 @@ impl WindowKey {
             return None;
         }
         Some(Self {
-            pid,
-            process_start_time: process_start_time(pid).unwrap_or(0),
-            exe_path: process_exe_path(pid).unwrap_or_default(),
+            process: ProcessKey {
+                pid,
+                process_start_time: process_start_time(pid).unwrap_or(0),
+                exe_path: process_exe_path(pid).unwrap_or_default(),
+            },
             class_name: class_name_of(hwnd),
+            generation: instance_generation(hwnd.0 as isize as i64),
         })
     }
 
@@ -146,23 +192,54 @@ impl WindowKey {
     /// 拿不到的字段按「通配」处理：权限不足导致读不到 exe 路径时，
     /// 不能因此把正常窗口判成换了 —— 那会把用户的从窗口无故踢掉。
     /// `pid` 是唯一必须对上的：句柄换了进程，一定是另一个窗口。
+    ///
+    /// `generation` 是另一个硬条件，而且**不通配**：它是我们自己数出来的，
+    /// 不存在「读不到」的情况，0 就是实实在在的第一代。代次不同 = 这个句柄值
+    /// 在两次采集之间被销毁过 = 现在挂着的一定是别的窗口实例。
     pub fn matches(&self, other: &Self) -> bool {
-        if self.pid != other.pid {
+        if self.process.pid != other.process.pid {
             return false;
         }
-        same_or_unknown(self.process_start_time, other.process_start_time)
-            && same_text(&self.exe_path, &other.exe_path)
+        same_or_unknown(self.process.process_start_time, other.process.process_start_time)
+            && same_text(&self.process.exe_path, &other.process.exe_path)
             && same_text(&self.class_name, &other.class_name)
+            && self.generation == other.generation
     }
 
     pub fn describe(&self) -> String {
-        let exe = file_name(&self.exe_path);
+        let exe = file_name(&self.process.exe_path);
         if exe.is_empty() {
-            format!("pid={} [{}]", self.pid, self.class_name)
+            format!("pid={} [{}]", self.process.pid, self.class_name)
         } else {
-            format!("{exe} (pid={}) [{}]", self.pid, self.class_name)
+            format!("{exe} (pid={}) [{}]", self.process.pid, self.class_name)
         }
     }
+}
+
+// ── 窗口实例代次 ──────────────────────────────────────────────────────────
+
+/// 句柄值 → 这个值上已经销毁过几次。
+///
+/// 只增不减：句柄销毁后我们不主动清理，因为「下一个占用这个句柄值的窗口」
+/// 正是要跟旧记录比较的对象，清掉就等于把复用又放过去了。
+/// 表的大小受「进程存活期内出现过的不同 HWND 值」限制，实际是个小常数级。
+static INSTANCE_GEN: Lazy<Mutex<HashMap<i64, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 记一次「这个句柄值的窗口销毁了」，代次 +1。
+///
+/// 必须由**生命周期事件**来调（`EVENT_OBJECT_DESTROY` 那条路），不能靠轮询
+/// `IsWindow`：轮询只能看到「现在没了」，看不到「中间没了一次又回来了」，
+/// 而后者恰恰是句柄复用最需要抓住的窗口期。
+pub fn note_instance_destroyed(hwnd: i64) {
+    if hwnd == 0 {
+        return;
+    }
+    *INSTANCE_GEN.lock().entry(hwnd).or_insert(0) += 1;
+}
+
+/// 读当前代次；没记录过就是 0（第一代）。
+fn instance_generation(hwnd: i64) -> u64 {
+    INSTANCE_GEN.lock().get(&hwnd).copied().unwrap_or(0)
 }
 
 /// 0 表示没取到（老系统 / 权限不足），此时不参与比较
@@ -334,13 +411,48 @@ pub static SLAVE_KEYS: Lazy<KeyMap> = Lazy::new(KeyMap::default);
 mod tests {
     use super::*;
 
+    /// 造一份身份。测试大多只关心「哪一项不一样」，代次默认取第一代（0）
     fn key(pid: u32, started: u64, exe: &str, class: &str) -> WindowKey {
+        key_with_generation(pid, started, exe, class, 0)
+    }
+
+    fn key_with_generation(
+        pid: u32,
+        started: u64,
+        exe: &str,
+        class: &str,
+        generation: u64,
+    ) -> WindowKey {
         WindowKey {
-            pid,
-            process_start_time: started,
-            exe_path: exe.to_string(),
+            process: ProcessKey {
+                pid,
+                process_start_time: started,
+                exe_path: exe.to_string(),
+            },
             class_name: class.to_string(),
+            generation,
         }
+    }
+
+    /// 本次修复的核心断言：**同一个进程内窗口重建 + 系统把同一个 HWND 值复用给新窗口**。
+    ///
+    /// 这种复用前面四项一个都不会变（同一个进程、同一份 exe、同一个类名），
+    /// 只有代次能说出来 —— 旧窗口销毁过，句柄值再出现时已经不是它了。
+    #[test]
+    fn same_process_rebuilt_window_is_detected_by_generation() {
+        // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+        let _guard = crate::test_support::serial();
+        let before = key_with_generation(100, 1111, r"C:\Games\a.exe", "UnityWndClass", 0);
+        let after = key_with_generation(100, 1111, r"C:\Games\a.exe", "UnityWndClass", 1);
+        assert!(
+            !before.matches(&after),
+            "同进程内窗口重建 + 句柄复用必须能识别出来"
+        );
+        assert!(!after.matches(&before), "代次比较必须对称");
+        assert!(
+            before.matches(&key_with_generation(100, 1111, r"C:\Games\a.exe", "UnityWndClass", 0)),
+            "代次没动就是同一个实例"
+        );
     }
 
     #[test]
@@ -465,6 +577,35 @@ mod tests {
         drop(window); // Drop 里 DestroyWindow
         assert!(WindowIdentity::of(hwnd).is_none());
         assert!(WindowKey::of(hwnd).is_none());
+    }
+
+    /// 真窗口：销毁事件一到，哪怕窗口本身还活着，身份也必须判成「不是它了」
+    #[test]
+    fn generation_bump_invalidates_a_live_window() {
+        // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+        let _guard = crate::test_support::serial();
+        let map = KeyMap::default();
+        let window = crate::test_support::popup_window();
+        let hwnd = window.0 .0 as isize as i64;
+
+        let captured = WindowKey::of(window.0).expect("真实窗口应该采得到身份");
+        let generation_before = captured.generation;
+        map.insert(hwnd, captured);
+        assert!(map.still_original(hwnd), "刚记下的窗口必须认得出来");
+
+        // 模拟监听线程收到 `EVENT_OBJECT_DESTROY`：窗口对象这会儿还在（这里并没有
+        // `DestroyWindow`），但「这个句柄值销毁过一次」这件事已经发生，下一个占用
+        // 它的就是另一个实例 —— 所以身份判定要立刻翻脸，而不是等 `IsWindow` 变假
+        note_instance_destroyed(hwnd);
+        assert!(!map.still_original(hwnd), "代次推进后必须判成不是原窗口");
+        assert_eq!(
+            instance_generation(hwnd),
+            generation_before + 1,
+            "销毁一次代次只推进一格"
+        );
+
+        // 收尾：代次表是进程级全局状态，留着会污染后面复用同一句柄值的用例
+        INSTANCE_GEN.lock().remove(&hwnd);
     }
 
     /// KeyMap：记过就认，句柄换了就翻脸

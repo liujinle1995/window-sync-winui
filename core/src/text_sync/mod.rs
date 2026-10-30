@@ -40,7 +40,7 @@ mod pipeline_tests;
 #[cfg(test)]
 mod win_tests;
 
-pub use control::{Capability, ControlId, ReadResult};
+pub use control::{class_of, classify, focus_child, Capability, ControlId, ReadResult};
 
 use diff::Edit;
 use once_cell::sync::Lazy;

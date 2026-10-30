@@ -49,8 +49,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_UNICODE, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumWindows, GetForegroundWindow, GetWindowLongA, IsWindow, IsWindowVisible,
-    PostMessageA, SetForegroundWindow,
+    CallNextHookEx, EnumWindows, GetForegroundWindow, GetWindowLongA,
+    IsWindow, IsWindowVisible, PostMessageA, PostMessageW, SetForegroundWindow,
     ShowWindow, GWL_STYLE, KBDLLHOOKSTRUCT,
     MSLLHOOKSTRUCT, SW_RESTORE, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
@@ -214,6 +214,17 @@ pub(crate) static SESSION: Lazy<Mutex<Option<session::SyncSession>>> =
 /// 锁内只做读写判断，**不要在持锁时调用 `stop_sync()`** —— 那要 join 线程，
 /// 而线程可能正等着这把锁。
 pub(crate) static ROLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+/// 串行化「同步选项变更」与「钩子里的按键记账」。
+///
+/// 关掉键盘 / 鼠标同步时要把已经按下的键补一个抬起，但补抬起与钩子记账之间有一个
+/// 致命的交错：钩子读到开关还是 true → 变更线程置 false 并把按键表取空、投出抬起 →
+/// 钩子这才把这次按下记进表里并投出按下。结果就是**按下的消息排在抬起之后**，
+/// 从窗口从此一直认为这个键按着。
+///
+/// 所以两边都必须拿着这把锁：变更线程在锁内「改开关 + 取状态 + 投抬起」，
+/// 钩子在锁内「看开关 + 记账 + 投按下」。锁只包住记账与入队，不做任何耗时的事。
+pub(crate) static OPTIONS_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// 取当前事件总线。同步没启动时是 `None`，钩子直接放弃即可。
 #[inline]
@@ -487,7 +498,7 @@ fn post_mouse(msg: u32, pos: Pos) {
 
     for slave in live_slaves() {
         let (x, y) = map_client_point(pos.x, pos.y, pos.master_w, pos.master_h, slave);
-        if let Some((wp, lp)) = mouse_message(msg, x, y, pos.screen_x, pos.screen_y, 0, slave) {
+        if let Some((wp, lp)) = mouse_message(msg, x, y, &pos, 0, slave) {
             unsafe { let _ = PostMessageA(slave, msg, wp, lp); }
         }
     }
@@ -507,7 +518,7 @@ fn post_wheel(delta: i32, pos: Pos) {
         for slave in live_slaves() {
             let (x, y) = map_client_point(pos.x, pos.y, pos.master_w, pos.master_h, slave);
             if let Some((wp, lp)) = mouse_message(
-                WM_MOUSEWHEEL, x, y, pos.screen_x, pos.screen_y, step as i16, slave,
+                WM_MOUSEWHEEL, x, y, &pos, step as i16, slave,
             ) {
                 unsafe { let _ = PostMessageA(slave, WM_MOUSEWHEEL, wp, lp); }
             }
@@ -552,7 +563,7 @@ fn post_release(keys: &[(u32, u32)], buttons: u32) {
         if buttons & mask == 0 { continue; }
         for &slave in &targets {
             let (x, y) = map_client_point(pos.x, pos.y, pos.master_w, pos.master_h, slave);
-            if let Some((wp, lp)) = mouse_message(msg, x, y, pos.screen_x, pos.screen_y, 0, slave) {
+            if let Some((wp, lp)) = mouse_message(msg, x, y, &pos, 0, slave) {
                 unsafe { let _ = PostMessageA(slave, msg, wp, lp); }
             }
         }
@@ -597,30 +608,110 @@ pub(crate) fn spawn_text_worker(bus: Arc<EventBus>) -> JoinHandle<()> {
     })
 }
 
-/// 逐字注入文本。每个字之间检查一次停止标志，停止时最多再等一个字的时间。
+/// `WM_CHAR`：字符消息，`wParam` 是 UTF-16 码元。
+const WM_CHAR: u32 = 0x0102;
+
+/// 无焦点写入：直接往焦点控件投 `WM_CHAR`。
+///
+/// 为什么只投 `WM_CHAR`、不补 `WM_KEYDOWN`：标准 Edit 收到字符消息就会把它插进去，
+/// 再补一个按下消息，目标自己的 `TranslateMessage` 会**又**生成一次字符 —— 实测多打一个字。
+///
+/// 目标控件必须是 `text_sync::Capability::Standard`（原生 Edit / RichEdit / WinForms /
+/// VCL / Scintilla）。WPF、Electron、Unity 这些自绘编辑器一条 `WM_CHAR` 都不吃
+/// （实测 WPF 的 TextBox 文本是靠它自己的 `WM_KEYDOWN` 生成的），只能走前台切换通道。
+fn post_text_without_focus(control: HWND, text: &str) -> bool {
+    let mut posted = false;
+    for unit in text.encode_utf16() {
+        if !SYNC_ACTIVE.load(Ordering::Relaxed) { break; }
+        unsafe {
+            // 必须是 W 版：`PostMessageA` 会把 `WM_CHAR` 的字符按 ANSI 转换一遍，
+            // 0x4E2D（中）被截成 0x2D（-）—— 中文全变乱码。实测踩过这个坑。
+            if PostMessageW(control, WM_CHAR, WPARAM(unit as usize), LPARAM(1)).is_ok() {
+                posted = true;
+            }
+        }
+    }
+    posted
+}
+
+/// 把前台还给「进来时是谁」，包括中途停止、出错提前返回的所有路径。
+///
+/// 手写 `SetForegroundWindow(master)` 的收尾只能盖住正常走完的那一条路：
+/// 注入过程中用户点了停止，函数在循环里 `return`，前台就留在最后一个从窗口上了。
+struct ForegroundGuard(Option<HWND>);
+
+impl ForegroundGuard {
+    fn take() -> Self {
+        let current = unsafe { GetForegroundWindow() };
+        Self(if current.0.is_null() { None } else { Some(current) })
+    }
+}
+
+impl Drop for ForegroundGuard {
+    fn drop(&mut self) {
+        let Some(h) = self.0 else { return };
+        unsafe {
+            if IsWindow(h).as_bool() {
+                let _ = SetForegroundWindow(h);
+            }
+        }
+    }
+}
+
+/// 文本注入：先试无焦点通道，不行才切前台。
+///
+/// 这个函数只服务**剪贴板中转**（Ctrl+C 复制 → 灌给从窗口）。文本镜像走的是另一条路
+/// （`text_sync::apply`，直接 `WM_SETTEXT` / 增量写回），不经过这里。
+///
+/// 两条通道的分工不是「实现细节」，而是**能力边界**，必须在日志和界面上说清楚：
+///
+/// | 通道 | 目标 | 代价 |
+/// |---|---|---|
+/// | 无焦点（`WM_CHAR`） | 标准 `Edit` / `RichEdit` / Scintilla 控件 | 不抢前台，不打断用户 |
+/// | 前台切换（`SendInput`） | 自绘控件、游戏、WPF、Electron | 会短暂切走前台，输入打到「当前前台」而不是指定窗口 |
+///
+/// 之所以不强行统一成一种：唯一能进游戏的通道就是模拟真实输入，而它天然要抢前台；
+/// 反过来对标准输入框用 `SendInput` 是完全没必要的打断。
 fn inject_text(text: &str) {
     if !SYNC_CLIPBOARD.load(Ordering::Relaxed) { return; }
 
-    let master = HWND(MASTER_HWND.load(Ordering::Relaxed) as *mut _);
     for slave in live_slaves() {
         if !SYNC_ACTIVE.load(Ordering::Relaxed) { return; }
-        unsafe { let _ = SetForegroundWindow(slave); }
-        std::thread::sleep(std::time::Duration::from_millis(25));
 
-        for ch in text.chars() {
-            if !SYNC_ACTIVE.load(Ordering::Relaxed) { return; }
-            unsafe { send_unicode_char(ch as u32); }
-            // 字符间隔：防止游戏端队列溢出
-            std::thread::sleep(std::time::Duration::from_millis(6));
+        // ① 无焦点通道：焦点落在标准文本控件上就直投 WM_CHAR，全程不动前台
+        if let Some(control) = text_sync::focus_child(slave) {
+            let class = text_sync::class_of(control);
+            if text_sync::classify(&class) == text_sync::Capability::Standard
+                && post_text_without_focus(control, text)
+            {
+                log(&format!("文本已无焦点写入 [{class}]（未切换前台）"));
+                continue;
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
 
-    // 归还焦点到主窗口
-    if unsafe { IsWindow(master).as_bool() } {
-        std::thread::sleep(std::time::Duration::from_millis(15));
-        unsafe { let _ = SetForegroundWindow(master); }
+        // ② 兜底：自绘控件 / 游戏。只能切前台 + 模拟输入，切完必须还回去
+        inject_text_with_focus(slave, text);
     }
+}
+
+/// 前台切换式注入：`SetForegroundWindow` + 逐字 `SendInput`。
+///
+/// 每个字之间停 6ms 是给游戏端的输入队列留余量；停止时最多再等一个字的时间。
+/// `ForegroundGuard` 保证任何提前返回都会把前台还回去。
+fn inject_text_with_focus(slave: HWND, text: &str) {
+    let _restore = ForegroundGuard::take();
+
+    unsafe { let _ = SetForegroundWindow(slave); }
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    log("目标不是标准输入框，改走前台切换通道（期间会短暂切换前台）");
+
+    for ch in text.chars() {
+        if !SYNC_ACTIVE.load(Ordering::Relaxed) { return; }
+        unsafe { send_unicode_char(ch as u32); }
+        // 字符间隔：防止游戏端队列溢出
+        std::thread::sleep(std::time::Duration::from_millis(6));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20));
 }
 
 /// 记录鼠标键的按下 / 抬起，供补投抬起时使用。
@@ -818,34 +909,46 @@ fn make_lp(x: i32, y: i32) -> LPARAM {
 /// 转回从窗口的屏幕坐标，保证落点仍在从窗口客户区内。
 ///
 /// 不认识的消息返回 `None`（调用方跳过，不要投递）。
+/// 组装一条鼠标消息的 `(wParam, lParam)`。
+///
+/// `mk` 是这次事件**发生时**的按键状态位。`WM_MOUSEMOVE` 的 `wParam` 不是空的：
+/// 里面要带 `MK_LBUTTON` / `MK_RBUTTON` / `MK_MBUTTON` / `MK_SHIFT` / `MK_CONTROL`。
+/// 早期实现把它固定成 0，于是靠标准消息判拖动的程序收到一串「没按住任何键的移动」，
+/// 拖动要么不生效、要么只挪一下 —— 这类程序不会去查 `GetKeyState`，它只信 `wParam`。
 fn mouse_message(
     msg: u32,
     x: i32,
     y: i32,
-    screen_x: i32,
-    screen_y: i32,
+    pos: &Pos,
     wheel_delta: i16,
     slave: HWND,
 ) -> Option<(WPARAM, LPARAM)> {
     let client = || make_lp(x, y);
+    // 事件发生时的按键状态位，随事件带过来的（见 `Pos::buttons`）
+    let mk = pos.buttons;
+
+    // 按下：这次事件本身把键压下去，wParam 要含它（事件发生时它还没被记进状态表）
+    // 抬起：这次事件把它松开，wParam 要去掉它
+    let with = |bit: u32| WPARAM((mk | bit) as usize);
+    let without = |bit: u32| WPARAM((mk & !bit) as usize);
 
     Some(match msg {
-        WM_MOUSEMOVE => (WPARAM(0), client()),
-        WM_LBUTTONDOWN => (WPARAM(0x0001), client()), // MK_LBUTTON
-        WM_LBUTTONUP => (WPARAM(0), client()),
-        WM_RBUTTONDOWN => (WPARAM(0x0002), client()), // MK_RBUTTON
-        WM_RBUTTONUP => (WPARAM(0), client()),
-        WM_MBUTTONDOWN => (WPARAM(0x0010), client()), // MK_MBUTTON
-        WM_MBUTTONUP => (WPARAM(0), client()),
+        WM_MOUSEMOVE => (WPARAM(mk as usize), client()),
+        WM_LBUTTONDOWN => (with(MK_LBUTTON), client()),
+        WM_LBUTTONUP => (without(MK_LBUTTON), client()),
+        WM_RBUTTONDOWN => (with(MK_RBUTTON), client()),
+        WM_RBUTTONUP => (without(MK_RBUTTON), client()),
+        WM_MBUTTONDOWN => (with(MK_MBUTTON), client()),
+        WM_MBUTTONUP => (without(MK_MBUTTON), client()),
         WM_MOUSEWHEEL => {
-            // 高 16 位是滚动量（有符号，向上为正）
-            let wp = WPARAM(((wheel_delta as u32) << 16) as usize);
+            // 高 16 位是滚动量（有符号，向上为正），低 16 位同样要带按键状态位
+            let wp = WPARAM((((wheel_delta as u32) << 16) | (mk & 0xFFFF)) as usize);
             let mut point = POINT { x, y };
             let lp = if unsafe { ClientToScreen(slave, &mut point) }.as_bool() {
                 make_lp(point.x, point.y)
             } else {
                 // 转不回屏幕坐标时退回原始屏幕坐标：位置会偏，但坐标系至少是对的
-                make_lp(screen_x, screen_y)
+                make_lp(pos.screen_x, pos.screen_y)
             };
             (wp, lp)
         }
@@ -1036,10 +1139,51 @@ pub(crate) fn text_sync_targets() -> Option<(HWND, Vec<HWND>)> {
     Some((HWND(master as *mut _), slaves))
 }
 
+/// 关掉某个开关时要补投的那一份按键状态：**只取被关掉的那一类**。
+///
+/// 只关键盘时鼠标键必须留着 —— 用户很可能正拖着画面去关键盘同步，
+/// 顺手把鼠标状态也清掉，从窗口那边就一直拖着了。
+fn take_releases(keyboard_off: bool, mouse_off: bool) -> (Vec<(u32, u32)>, u32) {
+    let mut state = PRESSED.lock();
+    let keys = if keyboard_off { state.drain_keys() } else { Vec::new() };
+    let buttons = if mouse_off { state.drain_buttons() } else { 0 };
+    (keys, buttons)
+}
+
+/// 同步选项变更 —— 不是「改三个布尔值」，而是一次状态转换。
+///
+/// 只改开关会留下一个必现的卡键：用户按下 W → 从窗口收到 KeyDown → 用户在这里关掉键盘同步
+/// → 用户松开 W → 钩子因为开关已经是 false 而不再转发 KeyUp → 从窗口永远认为 W 还按着。
+/// 鼠标键完全同理（拖拽途中关掉鼠标同步，从窗口会一直拖着）。
+///
+/// 所以这里必须：
+/// 1. 先把开关改掉（之后进来的抬起一律不转发，也就不会再制造新的按下）；
+/// 2. **在锁内**把已经按下的键 / 鼠标键取出来，作为一笔「补抬起」入队；
+/// 3. 补抬起走队列，天然排在已经入队的按下事件之后 —— 顺序反了等于没补。
+///
+/// 关键盘只放键盘、关鼠标只放鼠标：用户可能正拖着画面去关键盘同步，不能顺手把鼠标状态清掉。
 pub fn update_sync_options(sync_mouse: bool, sync_keyboard: bool, sync_clipboard: bool) -> Result<(), String> {
-    SYNC_MOUSE.store(sync_mouse, Ordering::Relaxed);
-    SYNC_KEYBOARD.store(sync_keyboard, Ordering::Relaxed);
-    SYNC_CLIPBOARD.store(sync_clipboard, Ordering::Relaxed);
+    let _options = OPTIONS_LOCK.lock();
+
+    let keyboard_was_on = SYNC_KEYBOARD.swap(sync_keyboard, Ordering::SeqCst);
+    let mouse_was_on = SYNC_MOUSE.swap(sync_mouse, Ordering::SeqCst);
+
+    // 与钩子互斥地取状态：钩子要么在锁外还没开始记账（那它随后会看到开关已关、
+    // 只记账不投递），要么已经记完并把这笔按下投进了队列（那这笔抬起就排在它后面）
+    let (keys, buttons) = take_releases(keyboard_was_on && !sync_keyboard, mouse_was_on && !sync_mouse);
+
+    if !keys.is_empty() || buttons != 0 {
+        let count = keys.len() + buttons.count_ones() as usize;
+        let what = if keys.is_empty() { "鼠标键" } else if buttons == 0 { "按键" } else { "按键与鼠标键" };
+        match bus() {
+            Some(bus) => bus.push_reliable(Reliable::Release { keys, buttons }),
+            None => post_release(&keys, buttons),
+        }
+        log(&format!("同步选项已关闭：补投抬起 {count} 个{what}"));
+    }
+
+    SYNC_CLIPBOARD.store(sync_clipboard, Ordering::SeqCst);
+
     // 修复：原实现修改选项后不推送状态，宿主 UI 与引擎实际状态会不一致
     emit_status();
     Ok(())
@@ -1058,13 +1202,64 @@ pub fn focus_window(hwnd: i64) -> Result<(), String> {
 
 // ── Hook 回调 ─────────────────────────────────────────────────────────────
 
+// `WM_MOUSEMOVE` / 按键消息 `wParam` 低位的按键状态位，取值与 Windows 的 `MK_*` 一致。
+// 不从 `windows` crate 导入是因为这几个常量分散在 `KeyboardAndMouse` 模块里，
+// 而这里只需要数值本身。
+const MK_LBUTTON: u32 = 0x0001;
+const MK_RBUTTON: u32 = 0x0002;
+const MK_SHIFT: u32 = 0x0004;
+const MK_CONTROL: u32 = 0x0008;
+const MK_MBUTTON: u32 = 0x0010;
+
+/// 左右 Ctrl / Shift 都要算，不能只认通用 `VK_CONTROL`。
+///
+/// 低级键盘钩子给的是**具体**键码：按住右 Ctrl 时 `vkCode` 可能是 `0xA3`，
+/// 只比对 `0x11` 就会漏掉 —— 这正是「Ctrl+C 触发不了剪贴板中转」的实际原因。
+static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
+static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+
+fn is_shift_vk(vk: u32) -> bool {
+    matches!(vk, 0x10 | 0xA0 | 0xA1) // VK_SHIFT / VK_LSHIFT / VK_RSHIFT
+}
+
+fn is_ctrl_vk(vk: u32) -> bool {
+    matches!(vk, 0x11 | 0xA2 | 0xA3) // VK_CONTROL / VK_LCONTROL / VK_RCONTROL
+}
+
+/// 此刻的鼠标键 / 修饰键状态位。
+///
+/// 鼠标消息的 `wParam` 必须带上它：很多程序（尤其是靠标准消息判拖动的）
+/// 是靠 `MK_LBUTTON` 判断「现在是不是在拖」，只发坐标会被当成单纯的光标移动。
+fn mk_flags() -> u32 {
+    let buttons = PRESSED.lock().buttons();
+    let mut mk = 0;
+    if buttons & BTN_LEFT != 0 { mk |= MK_LBUTTON; }
+    if buttons & BTN_RIGHT != 0 { mk |= MK_RBUTTON; }
+    if buttons & BTN_MIDDLE != 0 { mk |= MK_MBUTTON; }
+    if SHIFT_DOWN.load(Ordering::Relaxed) { mk |= MK_SHIFT; }
+    if CTRL_DOWN.load(Ordering::Relaxed) { mk |= MK_CONTROL; }
+    mk
+}
+
 pub(crate) unsafe extern "system" fn ms_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if code >= 0 && SYNC_ACTIVE.load(Ordering::Relaxed) && SYNC_MOUSE.load(Ordering::Relaxed) {
+    if code >= 0 && SYNC_ACTIVE.load(Ordering::Relaxed) {
+        let msg    = wp.0 as u32;
         let ms     = &*(lp.0 as *const MSLLHOOKSTRUCT);
         let master = HWND(MASTER_HWND.load(Ordering::Relaxed) as *mut _);
 
+        // 关掉鼠标同步后，移动与滚轮一律不采 —— 它们不改状态，也没有「留一半」的问题。
+        // 但**按键事件必须继续走完下面这段**：不记账就不知道这个键还按着，
+        // 等用户再关一次开关时就没有状态可放，从窗口会一直拖着。
+        let is_button = matches!(
+            msg,
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP
+        );
+        if !is_button && !SYNC_MOUSE.load(Ordering::Relaxed) {
+            return CallNextHookEx(None, code, wp, lp);
+        }
+
         // 鼠标移动频率太高，不为它多做一次窗口查询；按键类事件顺带看看是不是已经失焦
-        if wp.0 as u32 != WM_MOUSEMOVE {
+        if msg != WM_MOUSEMOVE {
             flush_if_focus_lost();
         }
         if GetForegroundWindow() == master {
@@ -1080,31 +1275,45 @@ pub(crate) unsafe extern "system" fn ms_hook(code: i32, wp: WPARAM, lp: LPARAM) 
                 screen_y: ms.pt.y,
                 master_w,
                 master_h,
+                // 取的是**这次事件发生时**的按键状态，不是投递时的 —— 队列里可能还压着
+                // 一串移动，等它们被投出去时用户早就松手了
+                buttons: mk_flags(),
             };
 
-            let msg = wp.0 as u32;
-            if let Some(bus) = bus() {
-                match msg {
-                    WM_MOUSEMOVE => bus.push_move(pos),
-                    WM_MOUSEWHEEL => bus.push_wheel((ms.mouseData >> 16) as i16, pos),
-                    WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
-                        note_button(msg, true);
-                        bus.push_reliable(Reliable::Button { msg, pos });
+            // 看开关、记账、入队必须在同一把锁里（理由见 `OPTIONS_LOCK` 的注释）
+            let _options = OPTIONS_LOCK.lock();
+            let forward = SYNC_MOUSE.load(Ordering::SeqCst);
+
+            match msg {
+                WM_MOUSEMOVE => {
+                    if forward {
+                        if let Some(bus) = bus() { bus.push_move(pos); }
                     }
-                    WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
-                        note_button(msg, false);
-                        bus.push_reliable(Reliable::Button { msg, pos });
-                    }
-                    _ => {}
                 }
+                WM_MOUSEWHEEL => {
+                    if forward {
+                        if let Some(bus) = bus() { bus.push_wheel((ms.mouseData >> 16) as i16, pos); }
+                    }
+                }
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+                    // 记账无条件：即使此刻不转发，也要知道它按着（松开时要能对上）
+                    note_button(msg, true);
+                    if forward {
+                        if let Some(bus) = bus() { bus.push_reliable(Reliable::Button { msg, pos }); }
+                    }
+                }
+                WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
+                    note_button(msg, false);
+                    if forward {
+                        if let Some(bus) = bus() { bus.push_reliable(Reliable::Button { msg, pos }); }
+                    }
+                }
+                _ => {}
             }
         }
     }
     CallNextHookEx(None, code, wp, lp)
 }
-
-// 跟踪 Ctrl 键状态（用于检测 Ctrl+C 手动触发剪贴板同步）
-static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 
 pub(crate) unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 && SYNC_ACTIVE.load(Ordering::Relaxed) {
@@ -1116,24 +1325,32 @@ pub(crate) unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) 
         flush_if_focus_lost();
 
         if GetForegroundWindow() == master {
-            let n  = wp.0 as u32;
-            let vk = kb.vkCode;
+            let n   = wp.0 as u32;
+            let vk  = kb.vkCode;
+            let down = n == WM_KEYDOWN || n == WM_SYSKEYDOWN;
+            let up   = n == WM_KEYUP || n == WM_SYSKEYUP;
 
             // 任何一个键都当作「文本可能变了」的信号去唤醒文本同步：
             // 它会立刻采样一次，比固定轮询快 0~120ms。可打印键顺便计入
             // 「疑似自绘输入框」的嫌疑统计（转发了按键但文本从不变化）。
-            if n == WM_KEYDOWN || n == WM_SYSKEYDOWN {
+            // 文本镜像与键盘转发是两个独立功能，这里不跟着 `SYNC_KEYBOARD` 走。
+            if down {
                 text_sync::note_key(vk);
             }
 
-            // 跟踪 Ctrl 键
-            if vk == 0x11 {  // VK_CONTROL
-                CTRL_DOWN.store(n == WM_KEYDOWN || n == WM_SYSKEYDOWN, Ordering::Relaxed);
+            // 修饰键跟踪：无条件，鼠标消息的 MK_SHIFT / MK_CONTROL 要用
+            if is_ctrl_vk(vk) {
+                CTRL_DOWN.store(down, Ordering::Relaxed);
+            }
+            if is_shift_vk(vk) {
+                SHIFT_DOWN.store(down, Ordering::Relaxed);
             }
 
             // Ctrl+C 检测：仅在 keydown 时触发一次（用 CTRL_DOWN 防重入）
+            // 放在 `SYNC_KEYBOARD` 之外 —— 剪贴板中转是独立功能，用户关掉键盘转发
+            // 仍然可能只想同步文本。
             if SYNC_CLIPBOARD.load(Ordering::Relaxed)
-                && (n == WM_KEYDOWN || n == WM_SYSKEYDOWN)
+                && down
                 && vk == 0x43  // VK_C
                 && CTRL_DOWN.load(Ordering::Relaxed)
             {
@@ -1166,17 +1383,17 @@ pub(crate) unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) 
                 }
             }
 
-            if SYNC_KEYBOARD.load(Ordering::Relaxed) {
-                if n == WM_KEYDOWN || n == WM_SYSKEYDOWN {
-                    PRESSED.lock().key_down(vk, kb.scanCode);
+            if down || up {
+                // 记账永远是「物理事实」：即使这次不转发，也要记住这个键按着 / 松了。
+                // 不记的话，关掉键盘同步那一刻就没有状态可放 —— 从窗口永久卡键。
+                let _options = OPTIONS_LOCK.lock();
+                {
+                    let mut state = PRESSED.lock();
+                    if down { state.key_down(vk, kb.scanCode) } else { state.key_up(vk) }
+                }
+                if SYNC_KEYBOARD.load(Ordering::SeqCst) {
                     if let Some(bus) = bus() {
-                        bus.push_reliable(Reliable::Key { down: true, vk, scan: kb.scanCode });
-                    }
-                } else if n == WM_KEYUP || n == WM_SYSKEYUP {
-                    // 抬起无条件记账：即便总线已经关了，状态表也不能留脏数据
-                    PRESSED.lock().key_up(vk);
-                    if let Some(bus) = bus() {
-                        bus.push_reliable(Reliable::Key { down: false, vk, scan: kb.scanCode });
+                        bus.push_reliable(Reliable::Key { down, vk, scan: kb.scanCode });
                     }
                 }
             }
@@ -1218,36 +1435,79 @@ pub fn launch_app(path: String, args: Vec<String>) -> Result<u32, String> {
     Ok(child.id())
 }
 
+/// 独占的系统句柄：`Drop` 里 `CloseHandle`。
+///
+/// 手写 `CloseHandle` 的写法在**失败路径**上一定会漏：`TerminateProcess(h)?` 一旦出错，
+/// 函数直接返回，后面那行 `CloseHandle` 根本走不到。进程管理是长跑功能（多开、反复开关客户端），
+/// 漏几个句柄不至于立刻出事，但会一点点把进程句柄表磨穿。
+struct OwnedHandle(windows::Win32::Foundation::HANDLE);
+
+impl OwnedHandle {
+    fn new(h: windows::Win32::Foundation::HANDLE) -> Self {
+        Self(h)
+    }
+
+    fn raw(&self) -> windows::Win32::Foundation::HANDLE {
+        self.0
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+}
+
 pub fn kill_process(pid: u32) -> Result<(), String> {
     if pid == u32::MAX { return Err("LNK 启动的进程请手动关闭".to_string()); }
     unsafe {
-        let h = OpenProcess(PROCESS_TERMINATE, false, pid).map_err(|e| format!("无法打开进程 ({}): {e}", e.code().0))?;
-        TerminateProcess(h, 1).map_err(|e| format!("终止进程失败: {e}"))?;
-        let _ = windows::Win32::Foundation::CloseHandle(h);
+        let h = OwnedHandle::new(
+            OpenProcess(PROCESS_TERMINATE, false, pid)
+                .map_err(|e| format!("无法打开进程 ({}): {e}", e.code().0))?,
+        );
+        TerminateProcess(h.raw(), 1).map_err(|e| format!("终止进程失败: {e}"))?;
     }
     Ok(())
 }
 
+/// 按可执行文件名结束进程。
+///
+/// 匹配必须是**完整文件名**。老实现还有一条 `n.starts_with(&name_low.replace(".exe",""))`，
+/// 于是杀 `game.exe` 时会顺手把 `game-helper.exe`、`gameupdater.exe` 一起带走 ——
+/// 用户只是想关掉客户端，结果连更新器 / 辅助进程都被杀了。
+/// 需要精确定位时优先用 `kill_process(pid)`，按名字只是兜底。
 pub fn kill_process_by_name(exe_name: String) -> Result<u32, String> {
+    let want = window_id::file_name(&exe_name).to_lowercase();
+    if want.is_empty() {
+        return Err("参数错误：进程名为空".to_string());
+    }
+
     unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).map_err(|e| e.to_string())?;
+        let snap = OwnedHandle::new(
+            CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).map_err(|e| e.to_string())?,
+        );
         let mut e = PROCESSENTRY32W::default();
         e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let name_low = exe_name.to_lowercase();
         let mut killed = 0u32;
-        if Process32FirstW(snap, &mut e).is_ok() {
+        if Process32FirstW(snap.raw(), &mut e).is_ok() {
             loop {
-                let n = String::from_utf16_lossy(&e.szExeFile.iter().take_while(|&&c|c!=0).cloned().collect::<Vec<_>>()).to_lowercase();
-                if n == name_low || n.starts_with(&name_low.replace(".exe","")) {
+                let n = String::from_utf16_lossy(
+                    &e.szExeFile.iter().take_while(|&&c| c != 0).cloned().collect::<Vec<_>>(),
+                )
+                .to_lowercase();
+                if n == want {
                     if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, e.th32ProcessID) {
-                        if TerminateProcess(h, 1).is_ok() { killed += 1; }
-                        let _ = windows::Win32::Foundation::CloseHandle(h);
+                        let h = OwnedHandle::new(h);
+                        if TerminateProcess(h.raw(), 1).is_ok() { killed += 1; }
                     }
                 }
-                if Process32NextW(snap, &mut e).is_err() { break; }
+                if Process32NextW(snap.raw(), &mut e).is_err() { break; }
             }
         }
-        let _ = windows::Win32::Foundation::CloseHandle(snap);
         Ok(killed)
     }
 }
@@ -1414,10 +1674,13 @@ pub(crate) mod test_support {
     /// 一个「绝对不属于当前窗口」的身份，用来模拟句柄被系统复用
     pub fn foreign_key() -> crate::window_id::WindowKey {
         crate::window_id::WindowKey {
-            pid: 0xDEAD,
-            process_start_time: 1,
-            exe_path: r"C:\Somewhere\other.exe".to_string(),
+            process: crate::window_id::ProcessKey {
+                pid: 0xDEAD,
+                process_start_time: 1,
+                exe_path: r"C:\Somewhere\other.exe".to_string(),
+            },
             class_name: "OtherWindowClass".to_string(),
+            generation: 0,
         }
     }
 }
@@ -1564,7 +1827,7 @@ mod tests {
 
         // 客户区点 (200,150) 的滚轮消息
         let (wp, lp) =
-            mouse_message(WM_MOUSEWHEEL, 200, 150, 0, 0, 120, slave.0).unwrap();
+            mouse_message(WM_MOUSEWHEEL, 200, 150, &Pos::default(), 120, slave.0).unwrap();
 
         // 落点 = 客户区原点 + 客户区坐标，绝不是把 (200,150) 直接塞进去
         assert_eq!((lp_x(lp), lp_y(lp)), (ox + 200, oy + 150));
@@ -1577,7 +1840,7 @@ mod tests {
     #[test]
     fn negative_wheel_delta_keeps_sign() {
         let slave = unsafe { popup(1200, 500, 400, 300) };
-        let (wp, _) = mouse_message(WM_MOUSEWHEEL, 10, 10, 0, 0, -120, slave.0).unwrap();
+        let (wp, _) = mouse_message(WM_MOUSEWHEEL, 10, 10, &Pos::default(), -120, slave.0).unwrap();
         assert_eq!((wp.0 as u32 >> 16) as u16 as i16, -120);
     }
 
@@ -1592,10 +1855,99 @@ mod tests {
             (WM_RBUTTONDOWN, 0x0002),
             (WM_MBUTTONDOWN, 0x0010),
         ] {
-            let (wp, lp) = mouse_message(msg, 137, 246, 9999, 9999, 0, slave.0).unwrap();
+            let (wp, lp) = mouse_message(msg, 137, 246, &Pos::default(), 0, slave.0).unwrap();
             assert_eq!((lp_x(lp), lp_y(lp)), (137, 246), "消息 {msg:#06X} 的 lParam 不是客户区坐标");
             assert_eq!(wp.0, expected_wp, "消息 {msg:#06X} 的 wParam 不对");
         }
+    }
+
+    /// 拖动能不能成立，全看移动消息的 `wParam` 有没有带 `MK_LBUTTON`。
+    /// 老实现把它写死成 0，从窗口收到的是「没按任何键的移动」，拖动要么不生效要么只挪一下。
+    #[test]
+    fn mouse_messages_carry_button_state_in_wparam() {
+        let slave = unsafe { popup(1200, 500, 400, 300) };
+        let with_mk = |mk: u32| Pos { buttons: mk, ..Default::default() };
+
+        // 拖着左键移动：状态位要跟着事件走
+        let (wp, _) =
+            mouse_message(WM_MOUSEMOVE, 10, 10, &with_mk(MK_LBUTTON), 0, slave.0).unwrap();
+        assert_eq!(wp.0, MK_LBUTTON as usize, "拖动中的移动没带 MK_LBUTTON");
+
+        // 已经按着右键，再按下左键：两个位都在
+        let (wp, _) =
+            mouse_message(WM_LBUTTONDOWN, 10, 10, &with_mk(MK_RBUTTON), 0, slave.0).unwrap();
+        assert_eq!(wp.0, (MK_LBUTTON | MK_RBUTTON) as usize);
+
+        // 抬起右键只清右键，别把还按着的左键一起抹掉
+        let both = with_mk(MK_LBUTTON | MK_RBUTTON);
+        let (wp, _) = mouse_message(WM_RBUTTONUP, 10, 10, &both, 0, slave.0).unwrap();
+        assert_eq!(wp.0, MK_LBUTTON as usize, "抬起右键把左键状态一起清掉了");
+
+        // 滚轮的低 16 位同样要带状态位
+        let (wp, _) =
+            mouse_message(WM_MOUSEWHEEL, 10, 10, &with_mk(MK_CONTROL), 120, slave.0).unwrap();
+        assert_eq!(wp.0 as u32 & 0xFFFF, MK_CONTROL, "滚轮消息的低字丢了按键状态");
+        assert_eq!((wp.0 as u32 >> 16) as u16 as i16, 120, "高位滚动量被状态位挤掉了");
+    }
+
+    /// 关掉一个开关只放对应的那一类：不能顺手把另一类的按下状态清掉。
+    #[test]
+    fn option_change_releases_only_the_kind_that_was_turned_off() {
+        let _guard = serial();
+        PRESSED.lock().drain();
+
+        // 用户按着 W，同时拖着鼠标左键
+        {
+            let mut st = PRESSED.lock();
+            st.key_down(0x57, 0x11);
+            st.button_down(BTN_LEFT);
+        }
+
+        // 只关键盘同步：键盘放掉，鼠标留着
+        let (keys, buttons) = take_releases(true, false);
+        assert_eq!(keys, vec![(0x57, 0x11)], "键盘没被放掉，从窗口会卡住 W");
+        assert_eq!(buttons, 0, "只关键盘却把鼠标键也一起放了");
+        assert_eq!(PRESSED.lock().buttons(), BTN_LEFT, "鼠标状态不该被清");
+
+        // 再关鼠标同步：这时候鼠标状态才该放掉
+        let (keys, buttons) = take_releases(false, true);
+        assert!(keys.is_empty());
+        assert_eq!(buttons, BTN_LEFT);
+        assert!(PRESSED.lock().is_empty());
+    }
+
+    /// 无焦点通道必须真的能把字符写进标准输入框，而且**不需要它持有前台**。
+    ///
+    /// 这条用例造的是「宿主窗口 + 真正的 Edit 子控件」，直接往控件投 `WM_CHAR`，
+    /// 全程不调 `SetForegroundWindow`：能读回文本，就说明「不抢焦点也能同步文本」成立。
+    #[test]
+    fn no_focus_channel_writes_into_a_real_edit_control() {
+        use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_GETTEXT};
+
+        let _guard = serial();
+        let host = crate::test_support::popup_window();
+        let edit = crate::test_support::edit_child(host.0);
+        crate::test_support::begin_fake_sync(crate::test_support::hwnd_value(host.0), &[]);
+
+        assert!(
+            post_text_without_focus(edit, "中文abc"),
+            "投递应当至少成功一次"
+        );
+        pump();
+
+        let mut buf = [0u16; 64];
+        let len = unsafe {
+            SendMessageW(
+                edit,
+                WM_GETTEXT,
+                WPARAM(buf.len()),
+                LPARAM(buf.as_mut_ptr() as isize),
+            )
+        };
+        let got = String::from_utf16_lossy(&buf[..len.0.clamp(0, buf.len() as isize) as usize]);
+        assert_eq!(got, "中文abc", "无焦点通道没把字符写进 Edit 控件");
+
+        crate::test_support::end_fake_sync();
     }
 
     // ── 端到端：投递路径（真实窗口 + 真实 PostMessage）────────────────────
@@ -1793,6 +2145,6 @@ mod tests {
     #[test]
     fn unknown_message_is_skipped() {
         let slave = unsafe { popup(1200, 500, 400, 300) };
-        assert!(mouse_message(0x0200 + 0x99, 10, 10, 0, 0, 0, slave.0).is_none());
+        assert!(mouse_message(0x0200 + 0x99, 10, 10, &Pos::default(), 0, slave.0).is_none());
     }
 }

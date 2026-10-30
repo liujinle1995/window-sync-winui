@@ -8,14 +8,25 @@
 //!
 //! 这里按「丢了会不会让从窗口卡死」分级：
 //!
-//! | 事件 | 处理 |
-//! |---|---|
-//! | 鼠标移动 | 只保留最新一条（覆盖写），位置本来就是「当前状态」 |
-//! | 滚轮 | 累计 delta，投递时一次发出去 |
-//! | 键盘按下 / 抬起 | 可靠队列，先进先出，绝不丢 |
-//! | 鼠标按下 / 抬起 | 可靠队列，绝不丢 |
-//! | 文本同步 | 独立队列 + 独立线程，注入慢也不挡鼠标键盘 |
+//! | 事件 | 丢弃策略 | 合并策略 |
+//! |---|---|---|
+//! | 鼠标移动 | 绝不丢，但可被更新的位置覆盖 | 只与**紧邻的上一条**移动合并 |
+//! | 滚轮 | 净额不为 0 就一定要投 | 只与**紧邻的上一条**滚轮合并 |
+//! | 键盘按下 / 抬起 | 绝不丢 | 不合并 |
+//! | 鼠标按下 / 抬起 | 绝不丢 | 不合并 |
+//! | 文本同步 | 独立队列 + 独立线程，注入慢也不挡鼠标键盘 | — |
 //! | 状态通知 | 由调用方按内容去重（见 `lib.rs` 的 `emit_status`） |
+//!
+//! ## 一条队列，而不是三条
+//!
+//! 早先的实现把三类事件分别存在 `latest_move` / `wheel` / `reliable` 三个槽里，
+//! 取事件时**固定**按「先移动、再滚轮、最后可靠事件」的顺序组装。这个顺序和用户实际操作的
+//! 顺序无关 —— 于是拖拽 `Down → Move → Up` 从队列里出来会变成 `Move → Down → Up`，
+//! 从窗口看到的就是「先移过去、再按下去、马上抬起」，拖拽要么失效、要么落点错乱。
+//!
+//! 现在只有一条 `queue`，顺序就是入队顺序。合并只发生在**相邻**的同类事件之间：
+//! `Move, Move, Move` 合成一条（位置取最后），但中间隔了 `Down` 就绝不跨过去合并，
+//! 否则 `Down` 前后的两次移动会被揉成一个，拖动轨迹依然会错。
 //!
 //! 「可靠」队列的真实增长源只有人的手指，速率极低；洪水全部来自移动事件，而它已经被合并掉了。
 
@@ -37,6 +48,11 @@ pub struct Pos {
     pub screen_y: i32,
     pub master_w: i32,
     pub master_h: i32,
+    /// 这次事件**发生那一刻**的鼠标键与修饰键状态位（`MK_LBUTTON` / `MK_SHIFT` …）。
+    ///
+    /// 必须随事件一起带着走，不能在投递时现取：队列里可能压着几条移动，
+    /// 等它们被投出去时用户早松手了，现取会把拖动中的移动全标成「没按键」。
+    pub buttons: u32,
 }
 
 /// 必须可靠投递的事件。
@@ -61,33 +77,65 @@ pub enum Task {
     Reliable(Reliable),
 }
 
-#[derive(Default)]
-struct WheelAgg {
-    delta: i32,
-    pos: Pos,
+/// 统一输入队列里的一项。
+///
+/// 三类事件共用一条队列，`Entry` 的存在只是为了「相邻同类可以合并」。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Entry {
+    Move(Pos),
+    Wheel { delta: i32, pos: Pos },
+    Reliable(Reliable),
+}
+
+/// 队列长度上限。正常情况根本到不了：消费者每收到一次配对通知就会排空一趟，
+/// 而且移动事件在入队时就被合并了。只有「消费者被卡住 + 移动与滚轮交替」才可能堆积。
+const QUEUE_CAP: usize = 4096;
+
+impl Entry {
+    /// 把 `newer` 合并进自己。只有相邻的同类事件能合并，返回是否合并成功。
+    fn absorb(&mut self, newer: &Self) -> bool {
+        match (self, newer) {
+            (Entry::Move(old), Entry::Move(new)) => {
+                // 位置是「状态」而不是「事件」：两条相邻的移动只留后一条，语义等价
+                *old = *new;
+                true
+            }
+            (
+                Entry::Wheel { delta, pos },
+                Entry::Wheel {
+                    delta: more,
+                    pos: at,
+                },
+            ) => {
+                *delta += *more;
+                *pos = *at;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Default)]
 struct Inner {
-    reliable: VecDeque<Reliable>,
-    latest_move: Option<Pos>,
-    wheel: Option<WheelAgg>,
+    queue: VecDeque<Entry>,
+    /// `queue` 里 `Reliable` 的条数。只为了让测试和排障能直接读，不用每次遍历。
+    reliable_count: usize,
     text: VecDeque<String>,
     closed: bool,
 }
 
 impl Inner {
     fn has_input(&self) -> bool {
-        // 滚轮净额为 0（向上再向下）不算有待投递内容，否则消费者会被一个空操作反复唤醒
-        self.latest_move.is_some()
-            || self.wheel.as_ref().is_some_and(|w| w.delta != 0)
-            || !self.reliable.is_empty()
+        // 净额为 0 的滚轮在入队时就被丢掉了，所以「队列非空」就是唯一判据
+        !self.queue.is_empty()
     }
 
     fn is_idle(&self) -> bool {
         !self.has_input() && self.text.is_empty()
     }
 }
+
 
 /// 事件总线：一个锁 + 一个条件变量，两个消费者（输入线程、文本线程）各取各的。
 pub struct EventBus {
@@ -115,26 +163,71 @@ impl EventBus {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 鼠标移动：覆盖上一条，不排队。
+    /// 鼠标移动：与紧邻的上一条移动合并，位置取最新。
+    ///
+    /// 为什么只和**队尾**合并：队尾不是移动，说明中间隔了 `Down` / `Up` / 滚轮，
+    /// 这次的移动必须作为独立一笔排在它们之后，否则跨过按键边界的移动会被揉进
+    /// `Down` 之前，拖动轨迹就错位了。
     pub fn push_move(&self, pos: Pos) {
-        self.lock().latest_move = Some(pos);
+        let mut g = self.lock();
+        // 先算，再借：`back_mut()` 持有可变借用期间不能再读 `queue.len()`
+        let room = g.queue.len() < QUEUE_CAP;
+        match g.queue.back_mut() {
+            Some(entry @ Entry::Move(_)) => {
+                entry.absorb(&Entry::Move(pos));
+            }
+            _ if room => g.queue.push_back(Entry::Move(pos)),
+            // 队列已经堆到上限（消费者被卡住）：退而求其次，覆盖队列里最近的一条移动，
+            // 保证「最新的位置」一定能送出去，又不让队列继续膨胀。可靠事件绝不受影响。
+            _ => {
+                if let Some(entry) = g
+                    .queue
+                    .iter_mut()
+                    .rev()
+                    .find(|e| matches!(e, Entry::Move(_)))
+                {
+                    entry.absorb(&Entry::Move(pos));
+                }
+            }
+        }
+        drop(g);
         self.cv.notify_all();
     }
 
-    /// 滚轮：累计滚动量，位置取最后一次。
+    /// 滚轮：与紧邻的上一条滚轮合并，位置取最后一次；合并后净额为 0 就整条丢掉。
     pub fn push_wheel(&self, delta: i16, pos: Pos) {
         let mut g = self.lock();
-        let agg = g.wheel.get_or_insert_with(WheelAgg::default);
-        agg.delta += delta as i32;
-        agg.pos = pos;
+        let newer = Entry::Wheel {
+            delta: delta as i32,
+            pos,
+        };
+        let room = g.queue.len() < QUEUE_CAP;
+        match g.queue.back_mut() {
+            Some(entry @ Entry::Wheel { .. }) => {
+                entry.absorb(&newer);
+                // 向上滚完又向下滚回来：净额 0 没有可投递的内容
+                let zero = matches!(entry, Entry::Wheel { delta: 0, .. });
+                if zero {
+                    g.queue.pop_back();
+                }
+            }
+            _ if room => g.queue.push_back(newer),
+            // 队列满时不追加滚轮：它不像位置那样有「最新值即全部」的性质，
+            // 但继续堆只会让积压更久，丢一笔滚轮比让整条链路延迟更可接受
+            _ => {}
+        }
         drop(g);
         self.cv.notify_all();
     }
 
     pub fn push_reliable(&self, ev: Reliable) {
-        self.lock().reliable.push_back(ev);
+        let mut g = self.lock();
+        g.queue.push_back(Entry::Reliable(ev));
+        g.reliable_count += 1;
+        drop(g);
         self.cv.notify_all();
     }
+
 
     /// 文本同步进独立队列。返回 `false` 表示队列已满（调用方负责记日志）。
     pub fn push_text(&self, text: String) -> bool {
@@ -158,7 +251,11 @@ impl EventBus {
         self.lock().closed
     }
 
-    /// 阻塞取一批输入任务：先移动、再滚轮，最后最多 `max_reliable` 条可靠事件。
+    /// 阻塞取一批输入任务，**严格按入队顺序**。
+    ///
+    /// 最多取 `max_reliable` 条可靠事件，移动与滚轮夹在它们中间按原顺序跟着走 ——
+    /// 取的是队列的一个前缀，所以批次边界不会打乱顺序：上一批末尾是 `Down`，
+    /// 下一批开头就是它之后那条移动，绝不会提前。
     ///
     /// 返回 `None` 表示队列已关闭且已排空，消费者可以退出。
     pub fn next_input(&self, max_reliable: usize) -> Option<Vec<Task>> {
@@ -166,28 +263,38 @@ impl EventBus {
         loop {
             if g.has_input() {
                 let mut out = Vec::new();
+                let mut reliable_taken = 0;
 
-                if let Some(pos) = g.latest_move.take() {
-                    out.push(Task::Move(pos));
-                }
+                // 先看队头是什么（借用在这里就结束），再决定要不要继续取
+                while let Some(is_reliable) = g
+                    .queue
+                    .front()
+                    .map(|e| matches!(e, Entry::Reliable(_)))
+                {
+                    if is_reliable && reliable_taken >= max_reliable {
+                        break;
+                    }
 
-                if let Some(agg) = g.wheel.take() {
-                    if agg.delta != 0 {
-                        out.push(Task::Wheel {
-                            delta: agg.delta,
-                            pos: agg.pos,
-                        });
+                    let Some(entry) = g.queue.pop_front() else {
+                        break;
+                    };
+                    match entry {
+                        Entry::Move(pos) => out.push(Task::Move(pos)),
+                        Entry::Wheel { delta, pos } => {
+                            if delta != 0 {
+                                out.push(Task::Wheel { delta, pos });
+                            }
+                        }
+                        Entry::Reliable(ev) => {
+                            reliable_taken += 1;
+                            g.reliable_count -= 1;
+                            out.push(Task::Reliable(ev));
+                        }
                     }
                 }
 
-                for _ in 0..max_reliable {
-                    match g.reliable.pop_front() {
-                        Some(ev) => out.push(Task::Reliable(ev)),
-                        None => break,
-                    }
-                }
-
-                // 例如滚轮净额为 0：这一轮什么都没剩下，继续等
+                // 队列非空却一条都没产出（理论上只有净额 0 的滚轮，而那在入队时就丢了）：
+                // 继续等，别把空批次丢给消费者
                 if out.is_empty() {
                     continue;
                 }
@@ -227,7 +334,7 @@ impl EventBus {
 
     #[cfg(test)]
     fn reliable_len(&self) -> usize {
-        self.lock().reliable.len()
+        self.lock().reliable_count
     }
 }
 
@@ -271,6 +378,11 @@ impl PressedState {
         self.keys.is_empty() && self.buttons == 0
     }
 
+    /// 当前按着的鼠标键位掩码
+    pub fn buttons(&self) -> u32 {
+        self.buttons
+    }
+
     pub fn pressed_key_count(&self) -> usize {
         self.keys.len()
     }
@@ -281,6 +393,20 @@ impl PressedState {
         keys.sort_by_key(|(vk, _)| *vk);
         let buttons = std::mem::take(&mut self.buttons);
         (keys, buttons)
+    }
+
+    /// 只取走键盘部分，鼠标键状态留着。
+    ///
+    /// 关闭键盘同步时用：鼠标可能还按着（比如正拖着画面），不能顺手把它的状态清掉。
+    pub fn drain_keys(&mut self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self.keys.drain().collect();
+        keys.sort_by_key(|(vk, _)| *vk);
+        keys
+    }
+
+    /// 只取走鼠标键位掩码，键盘状态留着。
+    pub fn drain_buttons(&mut self) -> u32 {
+        std::mem::take(&mut self.buttons)
     }
 }
 
@@ -424,15 +550,160 @@ mod tests {
         assert_eq!(buttons, vec![0x0201u32, 0x0202u32], "按下与抬起都必须送达且顺序正确");
     }
 
+    /// 反过来：先入队的可靠事件必须排在**后**到的移动之前。
+    ///
+    /// 老实现固定「移动优先」，这条断言当时是反的（它断言的正是那个 bug）。
     #[test]
-    fn move_is_delivered_before_queued_reliable_events() {
+    fn queued_reliable_event_stays_ahead_of_a_later_move() {
         let bus = EventBus::new();
         bus.push_reliable(key(true, 0x20));
         bus.push_move(pos(7, 8));
 
         let batch = bus.next_input(8).unwrap();
-        assert_eq!(batch[0], Task::Move(pos(7, 8)));
-        assert_eq!(batch[1], Task::Reliable(key(true, 0x20)));
+        assert_eq!(batch[0], Task::Reliable(key(true, 0x20)));
+        assert_eq!(batch[1], Task::Move(pos(7, 8)));
+    }
+
+    // ── 跨类型顺序：拖拽能不能成立全看这个 ───────────────────────────────
+
+    #[test]
+    fn drag_keeps_down_move_up_order() {
+        let bus = EventBus::new();
+
+        // 用户按住左键拖了一下：Down → 一串 Move → Up，全部在消费者取走之前入队
+        bus.push_reliable(Reliable::Button {
+            msg: 0x0201, // WM_LBUTTONDOWN
+            pos: pos(10, 10),
+        });
+        for i in 1..=5 {
+            bus.push_move(pos(10 + i, 10 + i));
+        }
+        bus.push_reliable(Reliable::Button {
+            msg: 0x0202, // WM_LBUTTONUP
+            pos: pos(15, 15),
+        });
+
+        // 中间那些移动被合并成一条，但**必须停在 Down 之后、Up 之前**
+        let batch = bus.next_input(8).unwrap();
+        assert_eq!(
+            batch,
+            vec![
+                Task::Reliable(Reliable::Button { msg: 0x0201, pos: pos(10, 10) }),
+                Task::Move(pos(15, 15)),
+                Task::Reliable(Reliable::Button { msg: 0x0202, pos: pos(15, 15) }),
+            ],
+            "拖拽顺序被打乱：从窗口会看到「先移动、再按下、立刻抬起」"
+        );
+    }
+
+    #[test]
+    fn move_down_move_up_keeps_each_segment_separate() {
+        let bus = EventBus::new();
+
+        // 先移动、再按下、再移动、再抬起 —— 合并绝不能跨过 Down 边界
+        bus.push_move(pos(1, 1));
+        bus.push_move(pos(2, 2));
+        bus.push_reliable(Reliable::Button {
+            msg: 0x0201,
+            pos: pos(2, 2),
+        });
+        bus.push_move(pos(3, 3));
+        bus.push_move(pos(4, 4));
+        bus.push_reliable(Reliable::Button {
+            msg: 0x0202,
+            pos: pos(4, 4),
+        });
+
+        let batch = bus.next_input(8).unwrap();
+        assert_eq!(
+            batch,
+            vec![
+                Task::Move(pos(2, 2)),
+                Task::Reliable(Reliable::Button { msg: 0x0201, pos: pos(2, 2) }),
+                Task::Move(pos(4, 4)),
+                Task::Reliable(Reliable::Button { msg: 0x0202, pos: pos(4, 4) }),
+            ],
+            "按下前后的两次移动被揉成一条了"
+        );
+    }
+
+    #[test]
+    fn wheel_keeps_its_place_among_reliable_events() {
+        let bus = EventBus::new();
+
+        bus.push_wheel(120, pos(1, 1));
+        bus.push_reliable(key(true, 0x41));
+        bus.push_wheel(-240, pos(2, 2));
+        bus.push_reliable(key(false, 0x41));
+
+        let batch = bus.next_input(8).unwrap();
+        assert_eq!(
+            batch,
+            vec![
+                Task::Wheel { delta: 120, pos: pos(1, 1) },
+                Task::Reliable(key(true, 0x41)),
+                Task::Wheel { delta: -240, pos: pos(2, 2) },
+                Task::Reliable(key(false, 0x41)),
+            ],
+            "滚轮不能无条件抢到可靠事件前面"
+        );
+    }
+
+    /// 批次边界也不能改变顺序：一次取不完时，下一批必须接着上一批的位置往后走。
+    #[test]
+    fn batching_never_reorders_across_batches() {
+        let bus = EventBus::new();
+
+        // Down, Move, Key, Key, Move, Up —— 每次只取 1 条可靠事件，逼出多次分批
+        bus.push_reliable(Reliable::Button { msg: 0x0201, pos: pos(1, 1) });
+        bus.push_move(pos(2, 2));
+        bus.push_reliable(key(true, 0x41));
+        bus.push_reliable(key(false, 0x41));
+        bus.push_move(pos(3, 3));
+        bus.push_reliable(Reliable::Button { msg: 0x0202, pos: pos(3, 3) });
+
+        let mut got = Vec::new();
+        while let Some(batch) = bus.next_input(1) {
+            got.extend(batch);
+            if bus.is_idle() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            got,
+            vec![
+                Task::Reliable(Reliable::Button { msg: 0x0201, pos: pos(1, 1) }),
+                Task::Move(pos(2, 2)),
+                Task::Reliable(key(true, 0x41)),
+                Task::Reliable(key(false, 0x41)),
+                Task::Move(pos(3, 3)),
+                Task::Reliable(Reliable::Button { msg: 0x0202, pos: pos(3, 3) }),
+            ]
+        );
+    }
+
+    /// 移动洪水期间按键抬起仍然按顺序送达（老 bug 的成因就是洪水把抬起挤掉）。
+    #[test]
+    fn moves_between_key_down_and_up_do_not_swallow_the_release() {
+        let bus = EventBus::new();
+        bus.push_reliable(key(true, 0x57)); // W
+        for i in 0..20_000 {
+            bus.push_move(pos(i, i));
+        }
+        bus.push_reliable(key(false, 0x57));
+
+        let mut got = Vec::new();
+        while let Some(batch) = bus.next_input(64) {
+            got.extend(batch);
+            if bus.is_idle() {
+                break;
+            }
+        }
+
+        assert_eq!(got.first(), Some(&Task::Reliable(key(true, 0x57))));
+        assert_eq!(got.last(), Some(&Task::Reliable(key(false, 0x57))));
+        assert_eq!(got.len(), 3, "中间的移动应当只剩一条，首尾是按下与抬起");
     }
 
     // ── 文本独立队列 ─────────────────────────────────────────────────────

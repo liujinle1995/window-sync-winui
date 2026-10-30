@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>COMPAT-EXTERNAL</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; font: 15px/1.6 Consolas, monospace; }
+  #t { position: absolute; left: 24px; top: 24px; width: 760px; height: 220px; font: 15px Consolas, monospace; }
+  #c { position: absolute; left: 24px; top: 270px; width: 760px; padding: 12px; background: #f2f6fb; border: 1px solid #c9d6e5; white-space: pre; }
+  #d { position: absolute; left: 24px; top: 430px; width: 760px; height: 200px; border: 2px dashed #9db7d5; }
+</style>
+</head>
+<body>
+<textarea id="t" placeholder="（这个框里出现字，说明 PostMessage 的按键被页面吃到了）"></textarea>
+<div id="c">waiting…</div>
+<div id="d">drag 区：mousedown → mousemove × n → mouseup</div>
+<script>
+  const s = { keydown: 0, keypress: 0, textinput: 0, mousedown: 0, mousemove: 0, mouseup: 0, wheel: 0, drop: 0, dragstart: 0 };
+  const t = document.getElementById('t');
+  const c = document.getElementById('c');
+
+  function render() {
+    c.textContent =
+      `keydown=${s.keydown} keypress=${s.keypress} textinput=${s.textinput}\n` +
+      `mousedown=${s.mousedown} mousemove=${s.mousemove} mouseup=${s.mouseup} wheel=${s.wheel}\n` +
+      `dragstart=${s.dragstart} drop=${s.drop}   textarea="${t.value}"`;
+  }
+
+  addEventListener('keydown', () => { s.keydown++; render(); }, true);
+  addEventListener('keypress', () => { s.keypress++; render(); }, true);
+  addEventListener('textInput', () => { s.textinput++; render(); }, true);
+  addEventListener('mousedown', () => { s.mousedown++; render(); }, true);
+  addEventListener('mousemove', () => { s.mousemove++; render(); }, true);
+  addEventListener('mouseup', () => { s.mouseup++; render(); }, true);
+  addEventListener('wheel', () => { s.wheel++; render(); }, true);
+  addEventListener('dragstart', () => { s.dragstart++; render(); }, true);
+  addEventListener('drop', () => { s.drop++; render(); }, true);
+  t.addEventListener('input', render);
+
+  // 自己抢焦点：后台窗口不会自动有 DOM 焦点
+  t.focus();
+  render();
+</script>
+</body>
+</html>
