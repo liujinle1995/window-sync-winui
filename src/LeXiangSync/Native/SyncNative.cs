@@ -5,20 +5,28 @@ using LeXiangSync.Models;
 
 namespace LeXiangSync.Native;
 
-/// <summary>调用方未及时释放 / 引擎返回错误时抛出。</summary>
-public sealed class NativeException : Exception
-{
-    public NativeException(string message) : base(message) { }
-}
-
 /// <summary>
 /// Rust 核心（window_sync_core.dll）的 P/Invoke 封装。
-/// ABI：输入为 UTF-8 JSON，输出为堆分配的 UTF-8 JSON 信封，需 wsync_free 回收。
+/// <para>
+/// 两条通道：
+/// <list type="bullet">
+/// <item>控制面 —— UTF-8 JSON 进、堆分配的 JSON 信封出，需要 <c>wsync_free</c> 回收。
+/// 启停、改配置、进程管理这些低频调用走这里，可读、好调试。</item>
+/// <item>数据面 —— POD 结构体按值返回、或一段连续字节（窗口列表）、或调用方缓冲区（文本）。
+/// 窗口刷新、状态轮询、大段文本走这里，没有序列化也没有解析。</item>
+/// </list>
+/// </para>
 /// </summary>
 internal static class SyncNative
 {
     private const string Dll = "window_sync_core";
     private const CallingConvention Cconv = CallingConvention.Cdecl;
+
+    /// <summary>
+    /// 前端期望的 ABI 版本。和 Rust <c>abi::ABI_VERSION</c> 必须一致，
+    /// 不一致时二进制块会被拒绝解析（而不是读出错位的数据）。
+    /// </summary>
+    public const uint ExpectedAbi = 2;
 
     private static readonly JsonSerializerOptions Json = new()
     {
@@ -28,22 +36,66 @@ internal static class SyncNative
 
     private static Utf8Callback? s_statusCb;
     private static Utf8Callback? s_logCb;
+    private static RevisionCallback? s_notifyCb;
+
+    private static ulong s_statusToken;
+    private static ulong s_logToken;
+    private static ulong s_notifyToken;
+
+    private static readonly uint s_abiVersion = SafeAbiVersion();
+    private static bool s_loggedAbiMismatch;
 
     [UnmanagedFunctionPointer(Cconv)]
     private delegate void Utf8Callback(IntPtr utf8);
 
-    // ── 基础 ──────────────────────────────────────────────────────────────
+    [UnmanagedFunctionPointer(Cconv)]
+    private delegate void RevisionCallback(ulong revision);
+
+    // ── 版本 / 生命周期 ───────────────────────────────────────────────────
     [DllImport(Dll, EntryPoint = "wsync_free", CallingConvention = Cconv)]
     private static extern void Free(IntPtr s);
 
-    [DllImport(Dll, EntryPoint = "wsync_version", CallingConvention = Cconv)]
-    private static extern IntPtr VersionCore();
+    [DllImport(Dll, EntryPoint = "wsync_free_bytes", CallingConvention = Cconv)]
+    private static extern void FreeBytes(IntPtr ptr, uint len);
 
+    [DllImport(Dll, EntryPoint = "wsync_abi_version", CallingConvention = Cconv)]
+    private static extern uint AbiVersionCore();
+
+    /// <summary>静态字符串，**不要** free。</summary>
+    [DllImport(Dll, EntryPoint = "wsync_core_version", CallingConvention = Cconv)]
+    private static extern IntPtr CoreVersionCore();
+
+    [DllImport(Dll, EntryPoint = "wsync_panic_mode", CallingConvention = Cconv)]
+    private static extern uint PanicModeCore();
+
+    [DllImport(Dll, EntryPoint = "wsync_shutdown", CallingConvention = Cconv)]
+    private static extern void ShutdownCore();
+
+    // ── 回调 ──────────────────────────────────────────────────────────────
     [DllImport(Dll, EntryPoint = "wsync_set_status_callback", CallingConvention = Cconv)]
-    private static extern void SetStatusCallbackCore(IntPtr cb);
+    private static extern ulong SetStatusCallbackCore(IntPtr cb);
+
+    [DllImport(Dll, EntryPoint = "wsync_set_status_notifier", CallingConvention = Cconv)]
+    private static extern ulong SetStatusNotifierCore(IntPtr cb);
 
     [DllImport(Dll, EntryPoint = "wsync_set_log_callback", CallingConvention = Cconv)]
-    private static extern void SetLogCallbackCore(IntPtr cb);
+    private static extern ulong SetLogCallbackCore(IntPtr cb);
+
+    [DllImport(Dll, EntryPoint = "wsync_clear_status_callback", CallingConvention = Cconv)]
+    private static extern byte ClearStatusCallbackCore(ulong token);
+
+    [DllImport(Dll, EntryPoint = "wsync_clear_status_notifier", CallingConvention = Cconv)]
+    private static extern byte ClearStatusNotifierCore(ulong token);
+
+    [DllImport(Dll, EntryPoint = "wsync_clear_log_callback", CallingConvention = Cconv)]
+    private static extern byte ClearLogCallbackCore(ulong token);
+
+    // ── 状态（POD） ───────────────────────────────────────────────────────
+    [DllImport(Dll, EntryPoint = "wsync_status_snapshot", CallingConvention = Cconv)]
+    private static extern StatusSnapshotNative StatusSnapshotCore();
+
+    [DllImport(Dll, EntryPoint = "wsync_status_revision", CallingConvention = Cconv)]
+    private static extern ulong StatusRevisionCore();
 
     // ── 查询 ──────────────────────────────────────────────────────────────
     [DllImport(Dll, EntryPoint = "wsync_get_processes", CallingConvention = Cconv)]
@@ -52,8 +104,21 @@ internal static class SyncNative
     [DllImport(Dll, EntryPoint = "wsync_get_windows", CallingConvention = Cconv)]
     private static extern IntPtr GetWindowsCore();
 
+    [DllImport(Dll, EntryPoint = "wsync_get_windows_bin", CallingConvention = Cconv)]
+    private static extern IntPtr GetWindowsBinCore(out uint len);
+
     [DllImport(Dll, EntryPoint = "wsync_get_sync_status", CallingConvention = Cconv)]
     private static extern IntPtr GetSyncStatusCore();
+
+    [DllImport(Dll, EntryPoint = "wsync_last_error", CallingConvention = Cconv)]
+    private static extern IntPtr LastErrorCore();
+
+    // ── 文本缓冲区 ────────────────────────────────────────────────────────
+    [DllImport(Dll, EntryPoint = "wsync_text_read", CallingConvention = Cconv)]
+    private static extern int TextReadCore(long hwnd, IntPtr buf, uint cap, out uint outLen);
+
+    [DllImport(Dll, EntryPoint = "wsync_text_write", CallingConvention = Cconv)]
+    private static extern int TextWriteCore(long hwnd, IntPtr buf, uint len);
 
     // ── 同步控制 ──────────────────────────────────────────────────────────
     [DllImport(Dll, EntryPoint = "wsync_start_sync", CallingConvention = Cconv)]
@@ -83,38 +148,153 @@ internal static class SyncNative
 
     // ── 公开 API ──────────────────────────────────────────────────────────
 
-    public static string CoreVersion => ReadString(VersionCore());
+    /// <summary>核心版本（静态字符串，零分配）。</summary>
+    public static string CoreVersion
+    {
+        get
+        {
+            var p = CoreVersionCore();
+            return p == IntPtr.Zero ? string.Empty : Marshal.PtrToStringUTF8(p) ?? string.Empty;
+        }
+    }
 
-    public static void SetStatusCallback(Action<string>? handler)
+    /// <summary>核心报告的二进制布局版本。</summary>
+    public static uint AbiVersion => s_abiVersion;
+
+    /// <summary>前端期望的 ABI 与核心是否一致。</summary>
+    public static bool AbiMatches => s_abiVersion == ExpectedAbi;
+
+    /// <summary>
+    /// 核心是不是用 <c>panic = "abort"</c> 构建的。是的话一旦内部 panic，
+    /// 整个进程会被直接终止，<c>catch_unwind</c> 不起作用 —— 启动时应当警告。
+    /// </summary>
+    public static bool UsesPanicAbort
+    {
+        get
+        {
+            try { return PanicModeCore() == 1; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+    }
+
+    /// <summary>
+    /// 注册状态通知（高频首选）：回调只带一个 revision，宿主自己来拉快照。
+    /// 返回 token，注销时要用同一个 token。
+    /// </summary>
+    public static ulong SetStatusNotifier(Action<ulong>? handler)
     {
         if (handler is null)
         {
-            SetStatusCallbackCore(IntPtr.Zero);
+            if (s_notifyToken != 0) ClearStatusNotifierCore(s_notifyToken);
+            s_notifyToken = 0;
+            s_notifyCb = null;
+            return 0;
+        }
+
+        s_notifyCb = rev => handler(rev);
+        s_notifyToken = SetStatusNotifierCore(Marshal.GetFunctionPointerForDelegate(s_notifyCb));
+        return s_notifyToken;
+    }
+
+    /// <summary>注册状态回调（JSON 载荷，兼容老宿主）。</summary>
+    public static ulong SetStatusCallback(Action<string>? handler)
+    {
+        if (handler is null)
+        {
+            if (s_statusToken != 0) ClearStatusCallbackCore(s_statusToken);
+            s_statusToken = 0;
             s_statusCb = null;
-            return;
+            return 0;
         }
+
         s_statusCb = p => handler(Marshal.PtrToStringUTF8(p) ?? string.Empty);
-        SetStatusCallbackCore(Marshal.GetFunctionPointerForDelegate(s_statusCb));
+        s_statusToken = SetStatusCallbackCore(Marshal.GetFunctionPointerForDelegate(s_statusCb));
+        return s_statusToken;
     }
 
-    public static void SetLogCallback(Action<string>? handler)
+    public static ulong SetLogCallback(Action<string>? handler)
     {
         if (handler is null)
         {
-            SetLogCallbackCore(IntPtr.Zero);
+            if (s_logToken != 0) ClearLogCallbackCore(s_logToken);
+            s_logToken = 0;
             s_logCb = null;
-            return;
+            return 0;
         }
+
         s_logCb = p => handler(Marshal.PtrToStringUTF8(p) ?? string.Empty);
-        SetLogCallbackCore(Marshal.GetFunctionPointerForDelegate(s_logCb));
+        s_logToken = SetLogCallbackCore(Marshal.GetFunctionPointerForDelegate(s_logCb));
+        return s_logToken;
     }
+
+    /// <summary>
+    /// 退出前调用：先停同步再摘回调。
+    /// 顺序不能反 —— 拆同步线程的过程中还会往回调里推东西，那时宿主可能已经析构了。
+    /// </summary>
+    public static void Shutdown()
+    {
+        try { ShutdownCore(); }
+        catch (EntryPointNotFoundException) { /* 老版本核心没有这个入口 */ }
+        catch (DllNotFoundException) { return; }
+
+        s_notifyToken = 0;
+        s_statusToken = 0;
+        s_logToken = 0;
+        s_notifyCb = null;
+        s_statusCb = null;
+        s_logCb = null;
+    }
+
+    /// <summary>
+    /// ABI 不匹配时记一次日志（只记一次，避免每次刷新都刷屏）。
+    /// </summary>
+    public static void WarnOnAbiMismatch(Action<string> log)
+    {
+        if (s_loggedAbiMismatch || AbiMatches) return;
+        s_loggedAbiMismatch = true;
+        log($"核心 ABI {s_abiVersion} 与前端期望的 {ExpectedAbi} 不一致，请重新构建 Rust 核心");
+    }
+
+    /// <summary>状态快照：POD 按值返回，无分配、无 JSON。</summary>
+    public static SyncStatus GetStatusFast() => StatusSnapshotCore().ToStatus();
+
+    public static ulong StatusRevision => StatusRevisionCore();
 
     public static IReadOnlyList<ProcessInfo> GetProcesses() =>
         Call(GetProcessesCore).Deserialize<List<ProcessInfo>>(Json) ?? new List<ProcessInfo>();
 
+    /// <summary>窗口列表（JSON，调试用）。</summary>
     public static IReadOnlyList<WindowInfo> GetWindows() =>
         Call(GetWindowsCore).Deserialize<List<WindowInfo>>(Json) ?? new List<WindowInfo>();
 
+    /// <summary>
+    /// 窗口列表（二进制）。几百个窗口时这条路省掉「序列化 + 解析 + 一堆小字符串」，
+    /// 只剩一次内存拷贝。
+    /// </summary>
+    public static List<WindowInfo> GetWindowsFast()
+    {
+        var ptr = GetWindowsBinCore(out var len);
+        if (ptr == IntPtr.Zero)
+        {
+            throw FromLastError("枚举窗口失败");
+        }
+
+        try
+        {
+            // 直接在这块本机内存上切片，不做中间拷贝 —— 这条路的意义就在这里
+            unsafe
+            {
+                var span = new ReadOnlySpan<byte>(ptr.ToPointer(), checked((int)len));
+                return WindowsBlob.Parse(span, ExpectedAbi);
+            }
+        }
+        finally
+        {
+            FreeBytes(ptr, len);
+        }
+    }
+
+    /// <summary>当前同步状态（JSON，兼容）。新代码用 <see cref="GetStatusFast"/>。</summary>
     public static SyncStatus GetSyncStatus() =>
         Call(GetSyncStatusCore).Deserialize<SyncStatus>(Json) ?? new SyncStatus();
 
@@ -141,7 +321,91 @@ internal static class SyncNative
     public static uint KillProcessByName(string exeName) =>
         Call(Serialize(new NameArgs(exeName)), KillProcessByNameCore).GetUInt32();
 
+    // ── 文本缓冲区 ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 读目标窗口的文本。先按 0 容量问一次长度，再按需分配 —— 大段文本不用猜大小。
+    /// 读不到（自绘控件）时抛 <see cref="NativeError.Unsupported"/>。
+    /// </summary>
+    public static string ReadText(long hwnd)
+    {
+        var rc = TextReadCore(hwnd, IntPtr.Zero, 0, out var need);
+        if (rc != (int)NativeError.BufferTooSmall)
+        {
+            if (rc != 0) throw FromCode(rc, "读取文本失败");
+            return string.Empty; // 空文本
+        }
+
+        var buf = Marshal.AllocHGlobal((int)need);
+        try
+        {
+            rc = TextReadCore(hwnd, buf, need, out var got);
+            if (rc != 0) throw FromCode(rc, "读取文本失败");
+            return Marshal.PtrToStringUTF8(buf, (int)got) ?? string.Empty;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buf);
+        }
+    }
+
+    /// <summary>把一段 UTF-8 文本整段写进目标窗口的文本控件。</summary>
+    public static void WriteText(long hwnd, string text)
+    {
+        var bytes = Encoding.UTF8.GetBytes(text);
+        var buf = Marshal.AllocHGlobal(bytes.Length);
+        try
+        {
+            Marshal.Copy(bytes, 0, buf, bytes.Length);
+            var rc = TextWriteCore(hwnd, buf, (uint)bytes.Length);
+            if (rc != 0) throw FromCode(rc, "写入文本失败");
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buf);
+        }
+    }
+
     // ── 内部工具 ──────────────────────────────────────────────────────────
+
+    private static uint SafeAbiVersion()
+    {
+        try { return AbiVersionCore(); }
+        catch (EntryPointNotFoundException) { return 0; } // 老核心没有这个入口
+        catch (DllNotFoundException) { return 0; }
+    }
+
+    private static NativeException FromCode(int rc, string fallback)
+    {
+        var error = Enum.IsDefined(typeof(NativeError), rc) ? (NativeError)rc : NativeError.Internal;
+        string message = fallback;
+        string? code = null;
+
+        try
+        {
+            var p = LastErrorCore();
+            if (p != IntPtr.Zero)
+            {
+                var json = Marshal.PtrToStringUTF8(p);
+                Free(p);
+                if (!string.IsNullOrEmpty(json))
+                {
+                    using var doc = JsonDocument.Parse(json);
+                    var root = doc.RootElement;
+                    if (root.TryGetProperty("code", out var c)) code = c.GetString();
+                    if (root.TryGetProperty("error", out var e)) message = e.GetString() ?? message;
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // 拿不到细节就用手上的兜底文案
+        }
+
+        return new NativeException(message, error, code);
+    }
+
+    private static NativeException FromLastError(string fallback) => FromCode(-1, fallback);
 
     private static string ReadString(IntPtr ptr)
     {
@@ -175,8 +439,14 @@ internal static class SyncNative
         if (root.ValueKind == JsonValueKind.String) return root;
         if (root.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True)
             return root.GetProperty("data").Clone();
+
         var message = root.TryGetProperty("error", out var err) ? err.GetString() : null;
-        throw new NativeException(message ?? "核心引擎返回未知错误");
+        var code = root.TryGetProperty("code", out var c) ? c.GetString() : null;
+        var value = root.TryGetProperty("code_value", out var cv) && cv.TryGetInt32(out var n)
+            ? (NativeError)n
+            : NativeError.Internal;
+
+        throw new NativeException(message ?? "核心引擎返回未知错误", value, code);
     }
 
     private static string Serialize<T>(T value) => JsonSerializer.Serialize(value, Json);

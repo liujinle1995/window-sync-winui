@@ -26,6 +26,9 @@ public sealed partial class SyncEngine : ObservableObject
     private bool _textMirror = true;
     private SyncStatus _status = new();
 
+    /// <summary>已经渲染过的状态版本号，用来丢掉迟到的旧快照。</summary>
+    private ulong _renderedRevision;
+
     public SyncEngine(LogService log)
     {
         _log = log;
@@ -37,13 +40,23 @@ public sealed partial class SyncEngine : ObservableObject
             OnPropertyChanged(nameof(CanStart));
         };
 
-        try { CoreVersion = SyncNative.CoreVersion; }
+        try
+        {
+            CoreVersion = SyncNative.CoreVersion;
+            if (SyncNative.UsesPanicAbort)
+            {
+                _log.Add("核心以 panic=abort 构建：内部一旦 panic 会直接终止整个进程", LogLevel.Warning);
+            }
+            SyncNative.WarnOnAbiMismatch(msg => _log.Add(msg, LogLevel.Warning));
+        }
         catch (Exception) { CoreVersion = "不可用（window_sync_core.dll 未加载）"; }
 
         // DLL 缺失时不让启动流程崩掉：所有命令都会走 Guard() 退化成日志提示
         try
         {
-            SyncNative.SetStatusCallback(OnStatusPushed);
+            // 状态走「无载荷通知 + 拉快照」：回调只带一个 revision，
+            // 不再每次变化都序列化一份 JSON 再解析回来。
+            SyncNative.SetStatusNotifier(OnStatusChanged);
             SyncNative.SetLogCallback(msg => _log.Add(msg));
         }
         catch (Exception) { /* CoreVersion 已给出提示 */ }
@@ -259,7 +272,7 @@ public sealed partial class SyncEngine : ObservableObject
         Task.Run(() => Guard(() => SyncNative.GetProcesses(), Array.Empty<ProcessInfo>()));
 
     public Task<IReadOnlyList<WindowInfo>> GetWindowsAsync() =>
-        Task.Run(() => Guard(() => SyncNative.GetWindows(), Array.Empty<WindowInfo>()));
+        Task.Run(() => Guard<IReadOnlyList<WindowInfo>>(() => SyncNative.GetWindowsFast(), Array.Empty<WindowInfo>()));
 
     public Task FocusAsync(long hwnd) =>
         Task.Run(() => Guard(() => { SyncNative.FocusWindow(hwnd); return true; }, false));
@@ -282,26 +295,39 @@ public sealed partial class SyncEngine : ObservableObject
 
     // ── 回调 ──────────────────────────────────────────────────────────────
 
-    private void OnStatusPushed(string json)
+    /// <summary>
+    /// 状态通知：只带 revision，这里自己去拉一次 POD 快照。
+    ///
+    /// 两个好处：Rust 侧不必为了通知序列化 JSON；宿主侧也不必解析。
+    /// 连续多次变化只会让我们多拉几次快照，而拉快照是一次按值返回的结构体读取。
+    /// </summary>
+    private void OnStatusChanged(ulong revision)
     {
-        SyncStatus? status = null;
-        try
-        {
-            status = JsonSerializer.Deserialize<SyncStatus>(json, new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true,
-            });
-        }
-        catch (JsonException) { /* 忽略坏包 */ }
+        // 比已经渲染过的还旧就跳过（回调可能在排队的这段时间里已经过时）
+        if (revision <= _renderedRevision) return;
 
-        if (status is null) return;
-        if (_dispatcher.HasThreadAccess) ApplyStatus(status);
-        else _dispatcher.TryEnqueue(() => ApplyStatus(status));
+        SyncStatus status;
+        try { status = SyncNative.GetStatusFast(); }
+        catch (Exception) { return; } // DLL 正在卸载之类，忽略这一拍
+
+        if (_dispatcher.HasThreadAccess) ApplyStatus(status, revision);
+        else _dispatcher.TryEnqueue(() => ApplyStatus(status, revision));
     }
 
-    private void ApplyStatus(SyncStatus status)
+    private void ApplyStatus(SyncStatus status, ulong revision)
     {
+        if (revision < _renderedRevision) return; // 迟到的旧快照
+        _renderedRevision = revision;
         Status = status;
         StatusChanged?.Invoke(this, status);
+    }
+
+    /// <summary>
+    /// 停同步 + 摘回调。宿主退出时必须调 —— 否则回调会打到已经析构的对象上。
+    /// </summary>
+    public void Dispose()
+    {
+        try { if (IsActive) Stop(); } catch (Exception) { /* 退出路径不抛 */ }
+        SyncNative.Shutdown();
     }
 }

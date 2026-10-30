@@ -73,7 +73,8 @@ window-sync-winui/
 ├── core/                        # Rust 同步引擎（cdylib）
 │   └── src/
 │       ├── lib.rs               # 原 Tauri 版 lib.rs 的逻辑本体
-│       ├── ffi.rs               # C ABI 导出层（JSON 信封）
+│       ├── ffi.rs               # C ABI 导出层（JSON 控制面 + 二进制数据面）
+│       ├── abi.rs               # ABI 版本 / 统一错误码 / POD 结构与二进制编码
 │       ├── event_bus.rs         # 分级事件队列 + 按键状态表
 │       ├── window_id.rs         # 窗口身份模型（HWND/PID/启动时间/EXE/类名/父窗/客户区/DPI）
 │       ├── window_watch.rs      # 窗口生命周期监听（SetWinEventHook，事件驱动）
@@ -84,7 +85,7 @@ window-sync-winui/
 │           └── apply.rs         #   三条写回通道：增量 / 退格 / 整段重写
 ├── scripts/build-core.ps1       # 单独构建 Rust 核心
 └── src/LeXiangSync/
-    ├── Native/                  # P/Invoke 封装（SyncNative / Win32 / WindowApi）
+    ├── Native/                  # P/Invoke 封装（SyncNative / NativeAbi 结构体与二进制解析 / Win32 / WindowApi）
     ├── Models/                  # 数据模型，与 Rust 结构体一一对应
     ├── Services/                # 引擎门面、日志、持久化、托盘、热键、主题、多开启动…
     ├── ViewModels/              # 每个页面一个 VM
@@ -246,28 +247,129 @@ Delphi/VCL（`TEdit` / `TMemo`）—— 它们内层都是原生 EDIT，漏判�
 
 退出等待还留了超时（2s）：真出了意外也只脱管一条线程并记日志，绝不把 UI 线程钉死在那里。
 
-## 原生互操作契约
+## 通信架构：控制面走 JSON，数据面走二进制
 
-所有调用返回同一个 JSON 信封，C# 侧统一解包：
+全走 JSON 开发最省事，但高频那几项是在替序列化库打工：Rust 侧拼字符串分配，
+C# 侧 `JsonDocument.Parse` 再解析一遍，中间还夹着一堆 `\uXXXX` 转义。
+所以按**频率**分成两条通道：
+
+| 通信内容 | 通道 | 为什么 |
+|---|---|---|
+| 启停同步 / 改配置 / 进程管理 / 聚焦 | JSON 信封 | 低频，可读、好调试、加字段不破坏兼容 |
+| 实时输入事件（鼠标键盘） | **Rust 内部通道**，不过 FFI | 每帧几十条；C# 只负责启停 |
+| 窗口列表刷新 | **二进制定长记录 + 字符串区** | 几百个窗口，省掉「序列化 + 解析 + 一堆小字符串」 |
+| 高频状态 | **POD 快照 + 无载荷通知** | 通知只带一个 revision，宿主自己来拉快照 |
+| 大段文本 | **UTF-8 缓冲区**（调用方自备内存） | 几千字不必转义、不必二次分配 |
+
+### 控制面：JSON 信封 + 统一错误码
 
 ```json
 { "ok": true,  "data": { } }
-{ "ok": false, "error": "…" }
+{ "ok": false, "code": "INVALID_ARG", "code_value": 1, "error": "…" }
 ```
+
+`code` 是给程序看的稳定标识，`error` 是给人看的中文说明——文案随便改，宿主不用跟着调整匹配逻辑。
+码表在 `core/src/abi.rs` 的 `Code`：`INVALID_ARG` / `INVALID_JSON` / `NOT_RUNNING` /
+`NO_MASTER` / `WINDOW_GONE` / `BUSY` / `UNSUPPORTED` / `BUFFER_TOO_SMALL` / `INTERNAL`。
+
+**参数校验在边界上做**：`master_hwnd == 0`、从窗口为空 / 含 0 / 含主窗口、三个开关全关、
+从窗口超过 16 个、`pid == 0`、空路径，都在进引擎之前拦下来，报错能精确到字段。
+二进制接口没法返回信封，约定是**返回 `i32` 错误码（0 = 成功）**，
+需要细节时调 `wsync_last_error()` 拿一条 JSON。
+
+### 数据面之一：二进制窗口列表
+
+```
+[header 20B][record × count][UTF-8 字符串区]
+ header = magic('WSW1', u32) | abi(u32) | count(u32) | record_size(u32) | string_bytes(u32)
+ record = hwnd(i64) | process_start_time(u64) | parent_hwnd(i64) | pid(u32) | dpi(u32)
+          client_w/height(i32×2) | visible(u32) | (exe|class|title)_(off,len)(u32×6)
+```
+
+定长记录才能被 C# 直接 `MemoryMarshal.Cast` 成结构体数组，字符串放块尾按 `(offset, len)` 引用。
+头部里带 `record_size`，宿主用自己的 `Marshal.SizeOf` 对一遍，对不上就明确报错——
+宁可显式失败，也不要按错位的偏移读出一堆垃圾。
+
+### 数据面之二：POD 状态快照 + 无载荷通知
+
+```c
+wsync_status_snapshot()   // 按值返回 32 字节结构体，零分配零解析
+wsync_status_revision()   // 只读版本号
+wsync_set_status_notifier(fn(u64))  // 回调只给 revision
+```
+
+以前每次状态变化都要序列化一份 `SyncStatus` JSON 塞给回调，宿主再反序列化。
+现在回调只传一个 `u64`，宿主比对一下自己渲染过的版本号，要刷新就去拉一次 POD 快照。
+**连续变化十次，宿主也只需要拉最后一次**——这就是「批量通知」，而且不需要用时间门限
+去合并（延迟门限会丢掉尾沿状态，反而让 UI 停在中间态）。
+旧的 JSON 回调 `wsync_set_status_callback` 保留，给还在用它的宿主。
+
+### 数据面之三：文本缓冲区
+
+```c
+int wsync_text_read(long hwnd, uint8_t* buf, uint32_t cap, uint32_t* out_len);
+int wsync_text_write(long hwnd, const uint8_t* buf, uint32_t len);
+```
+
+`cap = 0` 时返回 `BUFFER_TOO_SMALL` 并在 `out_len` 里给出**所需字节数**，宿主按这个值扩容再调一次——
+不用猜大小、也不用 Rust 侧代为分配。UTF-8 直接传，中文和 emoji 都不需要转义。
+
+### 版本、回调生命周期与 panic
+
+| 入口 | 说明 |
+|---|---|
+| `wsync_abi_version()` | 二进制布局版本。只有 `#[repr(C)]` 结构变化才 +1，JSON 加字段不用动 |
+| `wsync_core_version()` | 核心版本，静态字符串，**不需要释放** |
+| `wsync_panic_mode()` | 0 = unwind，1 = abort（宿主可据此告警） |
+| `wsync_shutdown()` | 停同步 + 摘全部回调，宿主退出前必须调 |
+
+回调注册都返回 **token**，注销要带同一个 token：
+
+```c
+uint64_t t = wsync_set_status_notifier(cb);   // 换回调时可能重新注册
+wsync_clear_status_notifier(t);               // 旧 token 注销不掉新装的
+```
+
+注销用 token 而不是裸指针，是因为宿主会在换窗口 / 重连时重装回调，
+拿旧 token 去注销一旦把新装的那个顺手清掉，就是「回调莫名不来了」。
+另外回调是**先出锁再调用**的——原先是 `if let Some(cb) = *SLOT.lock()`，
+临时 guard 会活到 if-let 结束，宿主回调里只要再回调进来一次就是自己锁自己。
+
+### panic 与构建配置
+
+`ffi.rs` 每个导出都套了 `catch_unwind`，但这**只在 `panic = "unwind"` 时才有意义**。
+`Cargo.toml` 的 release profile 因此显式写成 `panic = "unwind"`：
+
+```toml
+[profile.release]
+# panic = "abort" 会让 catch_unwind 变成摆设，而且一次 panic 直接带走整个宿主进程
+panic = "unwind"
+```
+
+这个 DLL 是被 WinUI 3 进程加载的，一次 panic 就是用户「程序凭空消失」。
+换成 unwind 后，`catch_unwind` 把 panic 变成 `INTERNAL` 错误码，宿主还能弹个提示继续活着。
+代价是二进制略大一点。宿主启动时会调 `wsync_panic_mode()` 自查，万一有人改回 `abort`，
+日志里会有一条警告，而不是等用户遇到「闪退」再猜。
+
+## 原生互操作契约
 
 | Rust 导出 | 说明 |
 |---|---|
-| `wsync_get_processes` / `wsync_get_windows` | 枚举进程 / 窗口 |
-| `wsync_get_sync_status` | 查询状态 |
+| `wsync_get_processes` / `wsync_get_windows` | 枚举进程 / 窗口（JSON） |
+| `wsync_get_windows_bin` | 窗口列表（二进制，`wsync_free_bytes` 释放） |
+| `wsync_get_sync_status` / `wsync_status_snapshot` | 状态（JSON / POD） |
 | `wsync_start_sync` / `wsync_stop_sync` | 启停同步 |
 | `wsync_update_sync_options` | 运行中修改同步项 |
 | `wsync_focus_window` | 聚焦并还原窗口 |
 | `wsync_launch_app` / `wsync_kill_process` / `wsync_kill_process_by_name` | 进程管理 |
-| `wsync_set_status_callback` / `wsync_set_log_callback` | 注册推送回调 |
-| `wsync_free` | 释放返回的字符串 |
+| `wsync_text_read` / `wsync_text_write` | 大段文本（UTF-8 缓冲区） |
+| `wsync_set_status_callback` / `wsync_set_status_notifier` / `wsync_set_log_callback` | 注册回调（返回 token） |
+| `wsync_clear_status_callback` / `wsync_clear_status_notifier` / `wsync_clear_log_callback` | 按 token 注销 |
+| `wsync_free` / `wsync_free_bytes` | 释放字符串 / 二进制块 |
+| `wsync_shutdown` | 停同步 + 摘回调 |
 
 约定：输入为 UTF-8 JSON；返回字符串由 Rust 用 `CString::into_raw` 分配，**必须**用 `wsync_free` 释放
-（`Native/SyncNative.cs` 已在 `finally` 里处理）。
+（`Native/SyncNative.cs` 已在 `finally` 里处理）；二进制块用 `wsync_free_bytes(ptr, len)`，长度要原样传回。
 
 ## 实现备注（WinUI 3 上踩过的坑）
 

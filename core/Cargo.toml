@@ -1,6 +1,6 @@
 [package]
 name = "window-sync-core"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "乐享同步操作 —— 核心同步引擎（Win32 窗口枚举 / 全局钩子 / 输入注入 / 进程管理）"
 license = "MIT"
@@ -35,5 +35,9 @@ windows    = { version = "0.58", features = [
 opt-level     = 3
 lto           = "thin"
 codegen-units = 1
-panic         = "abort"
+# 必须是 unwind：这个 DLL 是被宿主进程（WinUI 3）加载的，
+# panic = "abort" 意味着任何一次 panic 都会直接带走整个宿主进程，
+# 而且 ffi.rs 里每层 catch_unwind 都会变成摆设（abort 不走 unwind）。
+# 代价是二进制略大一点，换来的是「引擎内部出错 → 返回 INTERNAL 错误码，宿主继续活着」。
+panic         = "unwind"
 strip         = true

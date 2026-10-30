@@ -10,8 +10,11 @@
 //! 本文件与 Tauri 版 `src-tauri/src/lib.rs` 逻辑基本一致，仅去掉了 `#[tauri::command]`
 //! 与 AppHandle，状态推送改由 `ffi` 层注册的 C 回调完成。
 
+pub mod abi;
 pub mod event_bus;
 pub mod ffi;
+#[cfg(test)]
+mod ffi_tests;
 pub mod text_sync;
 pub mod window_id;
 pub mod window_watch;
@@ -24,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use windows::Win32::Foundation::{BOOL, HWND, HGLOBAL, LPARAM, LRESULT, POINT, WPARAM};
@@ -58,20 +61,106 @@ pub type StatusCb = extern "C" fn(*const c_char);
 /// 日志回调（UTF-8 文本）
 pub type LogCb = extern "C" fn(*const c_char);
 
-static STATUS_CB: Lazy<Mutex<Option<StatusCb>>> = Lazy::new(|| Mutex::new(None));
-static LOG_CB: Lazy<Mutex<Option<LogCb>>> = Lazy::new(|| Mutex::new(None));
+/// 不带载荷的状态通知：只告诉宿主「revision 变成这个数了」，让它自己来拉快照。
+///
+/// 这是高频场景的首选 —— 回调里没有任何序列化、没有字符串分配，宿主也只需要
+/// 比对一次 u64 就能决定要不要刷新。
+pub type StatusNotifyCb = extern "C" fn(u64);
 
-/// 注册 / 注销回调（由 ffi 层调用）
-pub fn set_status_callback(cb: Option<StatusCb>) {
-    *STATUS_CB.lock() = cb;
+/// 回调注册槽：`(token, 函数指针)`。token 为 0 表示未注册。
+///
+/// 带 token 是为了「注销得准」：宿主可能在换窗口/退出时重装回调，
+/// 拿旧 token 去注销不能把新装的那个顺手清掉。
+struct Slot<T: Copy> {
+    token: u64,
+    cb: Option<T>,
 }
-pub fn set_log_callback(cb: Option<LogCb>) {
-    *LOG_CB.lock() = cb;
+
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+static STATUS_CB: Lazy<Mutex<Slot<StatusCb>>> =
+    Lazy::new(|| Mutex::new(Slot { token: 0, cb: None }));
+static STATUS_NOTIFY: Lazy<Mutex<Slot<StatusNotifyCb>>> =
+    Lazy::new(|| Mutex::new(Slot { token: 0, cb: None }));
+static LOG_CB: Lazy<Mutex<Slot<LogCb>>> = Lazy::new(|| Mutex::new(Slot { token: 0, cb: None }));
+
+fn register<T: Copy>(slot: &Lazy<Mutex<Slot<T>>>, cb: Option<T>) -> u64 {
+    let mut s = slot.lock();
+    match cb {
+        None => {
+            s.token = 0;
+            s.cb = None;
+            0
+        }
+        Some(f) => {
+            let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+            s.token = token;
+            s.cb = Some(f);
+            token
+        }
+    }
+}
+
+/// token 匹配才注销，返回是否真的清掉了
+fn unregister<T: Copy>(slot: &Lazy<Mutex<Slot<T>>>, token: u64) -> bool {
+    let mut s = slot.lock();
+    if token == 0 || s.token != token {
+        return false;
+    }
+    s.token = 0;
+    s.cb = None;
+    true
+}
+
+/// 取出回调副本后**立刻释放锁**再调用。
+///
+/// 原先是 `if let Some(cb) = *SLOT.lock()`，临时 guard 会活到 if-let 结束 ——
+/// 也就是说回调是在持锁状态下被调用的。宿主回调里只要再回调进来一次（读状态、
+/// 改选项），就是自己锁自己。这里必须先拷出来。
+fn callback_of<T: Copy>(slot: &Lazy<Mutex<Slot<T>>>) -> Option<T> {
+    let s = slot.lock();
+    if s.token == 0 {
+        None
+    } else {
+        s.cb
+    }
+}
+
+/// 注册 / 注销状态回调（JSON 载荷，兼容旧宿主）。返回 token，0 表示未注册。
+pub fn set_status_callback(cb: Option<StatusCb>) -> u64 {
+    register(&STATUS_CB, cb)
+}
+/// 注册 / 注销无载荷状态通知。返回 token。
+pub fn set_status_notifier(cb: Option<StatusNotifyCb>) -> u64 {
+    register(&STATUS_NOTIFY, cb)
+}
+pub fn set_log_callback(cb: Option<LogCb>) -> u64 {
+    register(&LOG_CB, cb)
+}
+
+pub fn clear_status_callback(token: u64) -> bool {
+    unregister(&STATUS_CB, token)
+}
+pub fn clear_status_notifier(token: u64) -> bool {
+    unregister(&STATUS_NOTIFY, token)
+}
+pub fn clear_log_callback(token: u64) -> bool {
+    unregister(&LOG_CB, token)
+}
+
+/// 进程退出 / 宿主卸载 DLL 前调用：停同步 + 摘掉所有回调。
+///
+/// 顺序不能反：先停同步，否则拆线程的过程中还会往宿主回调里推东西，
+/// 而那时宿主可能已经在卸载自己的代理了。
+pub fn shutdown_all() {
+    let _ = stop_sync();
+    let _ = set_status_callback(None);
+    let _ = set_status_notifier(None);
+    let _ = set_log_callback(None);
 }
 
 /// 向宿主（WinUI 3）推送一条日志
 pub fn log(msg: &str) {
-    if let Some(cb) = *LOG_CB.lock() {
+    if let Some(cb) = callback_of(&LOG_CB) {
         if let Ok(c) = CString::new(msg.to_string()) {
             cb(c.as_ptr());
         }
@@ -200,8 +289,13 @@ pub struct ProcessInfo {
 pub struct SyncConfig  {
     pub master_hwnd: i64,
     pub slave_hwnds: Vec<i64>,
+    // 三项开关都给默认值：宿主少传一个字段不该变成「JSON 解析失败」，
+    // 而应该走到下面「至少开一项」这类能看懂的报错。
+    #[serde(default)]
     pub sync_mouse: bool,
+    #[serde(default)]
     pub sync_keyboard: bool,
+    #[serde(default)]
     pub sync_clipboard: bool,
     /// 文本镜像（中文 / 粘贴内容同步）
     #[serde(default)]
@@ -280,21 +374,63 @@ fn remove_hooks() {
     }
 }
 
+/// 状态版本号：任何字段变化都会 +1。
+///
+/// 宿主靠它判断「这条通知是不是比我已经渲染的新」，也让无载荷通知成为可能 ——
+/// 回调不用带任何数据，宿主拿这个数去比自己的最后一次即可。
+static STATUS_REVISION: AtomicU64 = AtomicU64::new(1);
+
+pub fn status_revision() -> u64 {
+    STATUS_REVISION.load(Ordering::Acquire)
+}
+
+/// 一次读出全部状态（POD，无分配）。
+///
+/// 各处字段本来就是原子量 / 短锁，这里不做「一致快照」的强同步 —— 从窗口数量
+/// 与 active 之间允许差一拍，因为宿主渲染的是「当前大概什么样」，
+/// 而真正的变更都由随后的通知再拉一次。要精确的话看 `revision` 是否变化即可。
+pub fn status_snapshot() -> abi::StatusSnapshot {
+    let mut flags = 0u32;
+    if SYNC_ACTIVE.load(Ordering::Relaxed) { flags |= abi::status_flag::ACTIVE; }
+    if SYNC_MOUSE.load(Ordering::Relaxed) { flags |= abi::status_flag::MOUSE; }
+    if SYNC_KEYBOARD.load(Ordering::Relaxed) { flags |= abi::status_flag::KEYBOARD; }
+    if SYNC_CLIPBOARD.load(Ordering::Relaxed) { flags |= abi::status_flag::CLIPBOARD; }
+    if text_sync::is_enabled() { flags |= abi::status_flag::TEXT_MIRROR; }
+
+    abi::StatusSnapshot {
+        abi: abi::ABI_VERSION,
+        flags,
+        slave_count: SLAVES.lock().len() as u32,
+        reserved: 0,
+        master_hwnd: MASTER_HWND.load(Ordering::Relaxed),
+        revision: STATUS_REVISION.load(Ordering::Acquire),
+    }
+}
+
 fn emit_status() {
-    let json = match serde_json::to_string(&get_sync_status()) {
+    let status = get_sync_status();
+    let json = match serde_json::to_string(&status) {
         Ok(j) => j,
         Err(_) => return,
     };
 
     // 合并重复通知：状态没变就不推。调用点很多（启停、改选项、从窗口掉线…），
     // 同一个状态被连着推几次纯属浪费宿主 UI 的重绘。
-    {
+    let revision = {
         let mut last = LAST_STATUS.lock();
         if *last == json { return; }
         *last = json.clone();
+        STATUS_REVISION.fetch_add(1, Ordering::AcqRel) + 1
+    };
+
+    // 新的无载荷通道：只传版本号，宿主自己来拉快照。
+    // 先拿副本再出锁 —— 宿主回调里可能又回调进来读状态。
+    if let Some(notify) = callback_of(&STATUS_NOTIFY) {
+        notify(revision);
     }
 
-    if let Some(cb) = *STATUS_CB.lock() {
+    // 旧的 JSON 通道保留，给还在用它的宿主
+    if let Some(cb) = callback_of(&STATUS_CB) {
         if let Ok(c) = CString::new(json) {
             cb(c.as_ptr());
         }
@@ -1132,6 +1268,31 @@ pub(crate) mod test_support {
         unsafe { popup("LxSyncIdentityTestHost", "identity-test", 400, 300) }
     }
 
+    /// 在 `parent` 里建一个真正的 `Edit` 子输入框（FFI 的文本缓冲区接口要拿它验）
+    pub fn edit_child(parent: HWND) -> HWND {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{WS_CHILD, WS_VISIBLE};
+        unsafe {
+            let instance: windows::Win32::Foundation::HINSTANCE =
+                GetModuleHandleW(None).unwrap().into();
+            CreateWindowExW(
+                Default::default(),
+                w!("Edit"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                220,
+                30,
+                Some(&parent),
+                None,
+                instance,
+                None,
+            )
+            .unwrap()
+        }
+    }
+
     pub unsafe fn popup(class: &str, title: &str, width: i32, height: i32) -> TestWindow {
         let class_w: Vec<u16> = class.encode_utf16().chain(std::iter::once(0)).collect();
         let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1555,6 +1716,45 @@ mod tests {
         note_button(WM_LBUTTONDOWN, true);
         note_button(WM_LBUTTONUP, false);
         assert_eq!(PRESSED.lock().drain(), (vec![], 0));
+    }
+
+    /// 无载荷通知：状态一变就带着新 revision 回调一次，回调里没有 JSON 也没有分配
+    #[test]
+    fn status_notifier_fires_with_a_revision() {
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        static LAST: AtomicU64 = AtomicU64::new(0);
+
+        extern "C" fn cb(rev: u64) {
+            HITS.fetch_add(1, Ordering::Relaxed);
+            LAST.store(rev, Ordering::Relaxed);
+        }
+
+        let _guard = serial();
+        let token = set_status_notifier(Some(cb));
+        assert_ne!(token, 0);
+
+        let master = crate::test_support::popup_window();
+        let slave = crate::test_support::popup_window();
+        crate::test_support::begin_fake_sync(
+            crate::test_support::hwnd_value(master.0),
+            &[crate::test_support::hwnd_value(slave.0)],
+        );
+        let rev = status_revision();
+        emit_status();
+
+        assert_eq!(HITS.load(Ordering::Relaxed), 1, "状态变了应该通知一次");
+        assert!(LAST.load(Ordering::Relaxed) > rev, "通知里的 revision 必须是新的");
+
+        // 状态没再变 -> 不重复通知
+        emit_status();
+        assert_eq!(HITS.load(Ordering::Relaxed), 1, "状态没变不该重复通知");
+
+        crate::test_support::end_fake_sync();
+        emit_status();
+        assert!(clear_status_notifier(token));
+        let after = HITS.load(Ordering::Relaxed);
+        emit_status();
+        assert_eq!(HITS.load(Ordering::Relaxed), after, "注销后不该再回调");
     }
 
     #[test]

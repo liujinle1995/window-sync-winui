@@ -761,6 +761,8 @@ public sealed partial class MainWindow : Window
         SaveWindowBounds();
         TitleBarDoubleClickGuard.Detach();
         if (App.Sync.IsActive) App.Sync.Stop();
+        // 摘掉 Rust 侧的回调再退出：否则拆同步线程时还会往已经关掉的窗口里推状态
+        App.Sync.Dispose();
         _tray.Dispose();
         _hotKey.Dispose();
         _hiddenWindow.Dispose();

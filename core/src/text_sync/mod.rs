@@ -158,6 +158,30 @@ pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+// ── 给 FFI 的「文本缓冲区」通道用的薄封装 ────────────────────────────────
+//
+// 大段文本不该走 JSON：几千字要先转成 `\uXXXX` 转义串、再在宿主那边解析回来，
+// 一次几毫秒还带上百 KB 垃圾。这两条直接吃 `&[u16]` / 吐 `Option<Vec<u16>>`，
+// 编码问题交给 FFI 层用 `*const u8` + 长度自己处理。
+
+/// 读目标窗口控件的文本；读不到（自绘控件 / 不是文本控件 / 无响应）返回 `None`
+pub(crate) fn read_control_text(hwnd: windows::Win32::Foundation::HWND) -> Option<Vec<u16>> {
+    match control::read(hwnd) {
+        ReadResult::Text { text, .. } => Some(text),
+        _ => None,
+    }
+}
+
+/// 整段写回目标窗口控件，光标停到末尾
+pub(crate) fn write_control_text(hwnd: windows::Win32::Foundation::HWND, units: &[u16]) -> bool {
+    apply::replace_all(hwnd, units, units.len())
+}
+
+/// 目标窗口是不是标准文本控件（决定 `read_control_text` 有没有意义）
+pub(crate) fn is_standard_control(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    matches!(control::identify(hwnd), Some(id) if id.capability == control::Capability::Standard)
+}
+
 /// 键盘钩子每转发一个键调一次：唤醒调度器；可打印字符额外计入「疑似自绘」统计。
 pub fn note_key(vk: u32) {
     if !RUNNING.load(Ordering::Relaxed) {
