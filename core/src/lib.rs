@@ -9,8 +9,11 @@
 //! 本文件与 Tauri 版 `src-tauri/src/lib.rs` 逻辑基本一致，仅去掉了 `#[tauri::command]`
 //! 与 AppHandle，状态推送改由 `ffi` 层注册的 C 回调完成。
 
+pub mod event_bus;
 pub mod ffi;
 pub mod text_mirror;
+
+use event_bus::{EventBus, Pos, PressedState, Reliable, Task, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -19,7 +22,8 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use windows::Win32::Foundation::{BOOL, HWND, HGLOBAL, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -75,29 +79,6 @@ struct SafeHook(HHOOK);
 unsafe impl Send for SafeHook {}
 unsafe impl Sync for SafeHook {}
 
-#[derive(Debug, Clone)]
-enum SyncEvent {
-    /// 鼠标事件。坐标同时带三套，因为三种消息要的坐标系不同（见 worker 里的注释）：
-    /// - `rel_x / rel_y`：主窗口**客户区**坐标，供移动与按键消息使用
-    /// - `master_w / master_h`：主窗口客户区尺寸，用来给不同大小的从窗口做比例映射
-    /// - `screen_x / screen_y`：原始**屏幕**坐标，滚轮兜底用
-    Mouse {
-        rel_x: i32,
-        rel_y: i32,
-        master_w: i32,
-        master_h: i32,
-        screen_x: i32,
-        screen_y: i32,
-        msg: u32,
-        wheel_delta: i16,
-    },
-    KeyDown       { vk: u32, scan: u32 },
-    KeyUp         { vk: u32, scan: u32 },
-    ClipboardText { text: String },   // 剪贴板中转：把文本逐字注入从窗口
-}
-
-struct SendTx(SyncSender<SyncEvent>);
-unsafe impl Sync for SendTx {}
 
 static SYNC_ACTIVE:    AtomicBool = AtomicBool::new(false);
 static SYNC_MOUSE:     AtomicBool = AtomicBool::new(true);
@@ -111,11 +92,24 @@ static LAST_CB_HASH:   Lazy<Mutex<u64>> = Lazy::new(|| Mutex::new(0));
 static SLAVES:  Lazy<Mutex<Vec<i64>>>         = Lazy::new(|| Mutex::new(vec![]));
 static KB_HOOK: Lazy<Mutex<Option<SafeHook>>> = Lazy::new(|| Mutex::new(None));
 static MS_HOOK: Lazy<Mutex<Option<SafeHook>>> = Lazy::new(|| Mutex::new(None));
-static TX:      Lazy<Mutex<Option<SendTx>>>   = Lazy::new(|| Mutex::new(None));
+static BUS:          Lazy<Mutex<Option<Arc<EventBus>>>>  = Lazy::new(|| Mutex::new(None));
+static INPUT_WORKER: Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
+static TEXT_WORKER:  Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
+static FOCUS_WATCH:  Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
 
+/// 还按着的键 / 鼠标键。补投抬起消息全靠它，见 `event_bus::PressedState` 的注释。
+static PRESSED: Lazy<Mutex<PressedState>> = Lazy::new(|| Mutex::new(PressedState::default()));
+
+/// 上一次推送出去的状态 JSON，用来合并重复通知。
+static LAST_STATUS: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+
+/// 最后一次鼠标位置：补投鼠标抬起时要用同一套坐标。
+static LAST_POS: Lazy<Mutex<Pos>> = Lazy::new(|| Mutex::new(Pos::default()));
+
+/// 取当前事件总线。同步没启动时是 `None`，钩子直接放弃即可。
 #[inline]
-fn enqueue(ev: SyncEvent) {
-    if let Some(s) = TX.lock().as_ref() { let _ = s.0.try_send(ev); }
+fn bus() -> Option<Arc<EventBus>> {
+    BUS.lock().clone()
 }
 
 // ── 读取剪贴板文本 ───────────────────────────────────────────────────────
@@ -270,7 +264,6 @@ fn remove_hooks() {
         if let Some(h) = KB_HOOK.lock().take()  { let _ = UnhookWindowsHookEx(h.0); }
         if let Some(h) = MS_HOOK.lock().take()  { let _ = UnhookWindowsHookEx(h.0); }
     }
-    *TX.lock() = None;
 }
 
 fn emit_status() {
@@ -278,6 +271,15 @@ fn emit_status() {
         Ok(j) => j,
         Err(_) => return,
     };
+
+    // 合并重复通知：状态没变就不推。调用点很多（启停、改选项、从窗口掉线…），
+    // 同一个状态被连着推几次纯属浪费宿主 UI 的重绘。
+    {
+        let mut last = LAST_STATUS.lock();
+        if *last == json { return; }
+        *last = json.clone();
+    }
+
     if let Some(cb) = *STATUS_CB.lock() {
         if let Ok(c) = CString::new(json) {
             cb(c.as_ptr());
@@ -285,80 +287,246 @@ fn emit_status() {
     }
 }
 
-// ── 工作线程：消费事件队列 ───────────────────────────────────────────────
-fn start_worker(rx: Receiver<SyncEvent>) {
-    std::thread::spawn(move || {
-        while let Ok(ev) = rx.recv() {
-            if !SYNC_ACTIVE.load(Ordering::Relaxed) { continue; }
-            let slaves: Vec<i64> = SLAVES.lock().clone();
-            unsafe {
-                match ev {
-                    SyncEvent::Mouse {
-                        rel_x, rel_y, master_w, master_h, screen_x, screen_y, msg, wheel_delta,
-                    } => {
-                        if !SYNC_MOUSE.load(Ordering::Relaxed) { continue; }
-                        for &h in &slaves {
-                            let s = HWND(h as *mut _);
-                            if !IsWindow(s).as_bool() { continue; }
+// ── 工作线程：消费事件总线 ────────────────────────────────────────────────
+//
+// 输入与文本分成两个线程：文本注入要逐字 SetForegroundWindow + sleep(6ms)，
+// 一次几百字就是好几秒。放在同一个线程里会把鼠标键盘全堵在后面，队列必然堆满 ——
+// 而这正是老实现丢事件的直接诱因之一。
 
-                            // 每个从窗口单独换算：客户区尺寸可能和主窗口不一样，
-                            // 直接沿用主窗口的坐标会在边缘处偏出去（点不中同一个按钮）。
-                            let (x, y) = map_client_point(rel_x, rel_y, master_w, master_h, s);
+/// 当前还活着的从窗口。顺手把已经销毁的窗口从列表里剔除。
+fn live_slaves() -> Vec<HWND> {
+    let (alive, removed) = {
+        let mut list = SLAVES.lock();
+        let before = list.len();
+        let alive: Vec<HWND> = list
+            .iter()
+            .map(|&h| HWND(h as *mut _))
+            .filter(|h| unsafe { IsWindow(*h).as_bool() })
+            .collect();
+        let removed = alive.len() != before;
+        if removed {
+            *list = alive.iter().map(|h| h.0 as isize as i64).collect();
+        }
+        (alive, removed)
+    };
 
-                            if let Some((wp, lp)) =
-                                mouse_message(msg, x, y, screen_x, screen_y, wheel_delta, s)
-                            {
-                                let _ = PostMessageA(s, msg, wp, lp);
-                            }
-                        }
-                    }
-                    SyncEvent::KeyDown { vk, scan } => {
-                        if !SYNC_KEYBOARD.load(Ordering::Relaxed) { continue; }
-                        for &h in &slaves {
-                            let s = HWND(h as *mut _);
-                            if IsWindow(s).as_bool() {
-                                let lp = (1u32 | (scan << 16)) as isize;
-                                let _ = PostMessageA(s, WM_KEYDOWN, WPARAM(vk as usize), LPARAM(lp));
-                            }
-                        }
-                    }
-                    SyncEvent::KeyUp { vk, scan } => {
-                        if !SYNC_KEYBOARD.load(Ordering::Relaxed) { continue; }
-                        for &h in &slaves {
-                            let s = HWND(h as *mut _);
-                            if IsWindow(s).as_bool() {
-                                let lp = (0xC0000001u32 | (scan << 16)) as isize;
-                                let _ = PostMessageA(s, WM_KEYUP, WPARAM(vk as usize), LPARAM(lp));
-                            }
-                        }
-                    }
-                    SyncEvent::ClipboardText { text } => {
-                        if !SYNC_CLIPBOARD.load(Ordering::Relaxed) { continue; }
-                        let master = HWND(MASTER_HWND.load(Ordering::Relaxed) as *mut _);
-                        let chars: Vec<u32> = text.chars().map(|c| c as u32).collect();
-                        for &h in &slaves {
-                            let slave = HWND(h as *mut _);
-                            if !IsWindow(slave).as_bool() { continue; }
-                            // 聚焦从窗口，逐字注入 Unicode
-                            let _ = SetForegroundWindow(slave);
-                            std::thread::sleep(std::time::Duration::from_millis(25));
-                            for &ch in &chars {
-                                send_unicode_char(ch);
-                                // 字符间隔：防止游戏端队列溢出
-                                std::thread::sleep(std::time::Duration::from_millis(6));
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                        }
-                        // 归还焦点到主窗口
-                        if IsWindow(master).as_bool() {
-                            std::thread::sleep(std::time::Duration::from_millis(15));
-                            let _ = SetForegroundWindow(master);
+    if removed {
+        // 从窗口失效：不再往它投递。它自己的按键状态随窗口销毁一起没了，
+        // 其余从窗口的按键状态保持不变 —— 补抬起只针对还活着的窗口，
+        // 否则会把别的窗口正常按着的键也放掉。
+        log("有从窗口已关闭，已从同步列表移除");
+        emit_status();
+    }
+
+    alive
+}
+
+/// 把鼠标消息投给所有从窗口。`pos` 是主窗口那套坐标，每个从窗口各自换算。
+fn post_mouse(msg: u32, pos: Pos) {
+    if !SYNC_MOUSE.load(Ordering::Relaxed) { return; }
+    *LAST_POS.lock() = pos;
+
+    for slave in live_slaves() {
+        let (x, y) = map_client_point(pos.x, pos.y, pos.master_w, pos.master_h, slave);
+        if let Some((wp, lp)) = mouse_message(msg, x, y, pos.screen_x, pos.screen_y, 0, slave) {
+            unsafe { let _ = PostMessageA(slave, msg, wp, lp); }
+        }
+    }
+}
+
+/// 投递累计后的滚轮量。累计值可能很大（一次攒了几十个刻度），拆成若干笔发。
+fn post_wheel(delta: i32, pos: Pos) {
+    if !SYNC_MOUSE.load(Ordering::Relaxed) { return; }
+    *LAST_POS.lock() = pos;
+
+    // 每个消息最多带 10 个刻度，避免一次极端累计把高 16 位顶出 i16 范围
+    const MAX_STEP: i32 = 1200;
+    let mut remaining = delta;
+    while remaining != 0 {
+        let step = remaining.clamp(-MAX_STEP, MAX_STEP);
+        remaining -= step;
+        for slave in live_slaves() {
+            let (x, y) = map_client_point(pos.x, pos.y, pos.master_w, pos.master_h, slave);
+            if let Some((wp, lp)) = mouse_message(
+                WM_MOUSEWHEEL, x, y, pos.screen_x, pos.screen_y, step as i16, slave,
+            ) {
+                unsafe { let _ = PostMessageA(slave, WM_MOUSEWHEEL, wp, lp); }
+            }
+        }
+    }
+}
+
+fn post_key(down: bool, vk: u32, scan: u32) {
+    if !SYNC_KEYBOARD.load(Ordering::Relaxed) { return; }
+
+    let (msg, lp) = if down {
+        (WM_KEYDOWN, (1u32 | (scan << 16)) as isize)
+    } else {
+        (WM_KEYUP, (0xC0000001u32 | (scan << 16)) as isize)
+    };
+
+    for slave in live_slaves() {
+        unsafe { let _ = PostMessageA(slave, msg, WPARAM(vk as usize), LPARAM(lp)); }
+    }
+}
+
+/// 补投抬起：把还按着的键和鼠标键全部放开。
+fn post_release(keys: &[(u32, u32)], buttons: u32) {
+    if keys.is_empty() && buttons == 0 { return; }
+
+    let targets = live_slaves();
+    if targets.is_empty() { return; }
+
+    for &(vk, scan) in keys {
+        let lp = (0xC0000001u32 | (scan << 16)) as isize;
+        for &slave in &targets {
+            unsafe { let _ = PostMessageA(slave, WM_KEYUP, WPARAM(vk as usize), LPARAM(lp)); }
+        }
+    }
+
+    let pos = *LAST_POS.lock();
+    for (mask, msg) in [
+        (BTN_LEFT, WM_LBUTTONUP),
+        (BTN_RIGHT, WM_RBUTTONUP),
+        (BTN_MIDDLE, WM_MBUTTONUP),
+    ] {
+        if buttons & mask == 0 { continue; }
+        for &slave in &targets {
+            let (x, y) = map_client_point(pos.x, pos.y, pos.master_w, pos.master_h, slave);
+            if let Some((wp, lp)) = mouse_message(msg, x, y, pos.screen_x, pos.screen_y, 0, slave) {
+                unsafe { let _ = PostMessageA(slave, msg, wp, lp); }
+            }
+        }
+    }
+}
+
+fn start_input_worker(bus: Arc<EventBus>) {
+    let handle = std::thread::spawn(move || {
+        while let Some(batch) = bus.next_input(64) {
+            let active = SYNC_ACTIVE.load(Ordering::Relaxed);
+            for task in batch {
+                match task {
+                    // 停止时排进来的「补抬起」必须照投，否则最后按住的那些键会卡在从窗口
+                    Task::Reliable(Reliable::Release { keys, buttons }) => post_release(&keys, buttons),
+                    other => {
+                        if !active { continue; }
+                        match other {
+                            Task::Move(pos) => post_mouse(WM_MOUSEMOVE, pos),
+                            Task::Wheel { delta, pos } => post_wheel(delta, pos),
+                            Task::Reliable(Reliable::Button { msg, pos }) => post_mouse(msg, pos),
+                            Task::Reliable(Reliable::Key { down, vk, scan }) => post_key(down, vk, scan),
+                            Task::Reliable(Reliable::Release { .. }) => {}
                         }
                     }
                 }
             }
         }
     });
+    *INPUT_WORKER.lock() = Some(handle);
+}
+
+/// 文本同步独立线程：注入慢也只影响它自己。
+fn start_text_worker(bus: Arc<EventBus>) {
+    let handle = std::thread::spawn(move || {
+        while let Some(text) = bus.next_text() {
+            if !SYNC_ACTIVE.load(Ordering::Relaxed) { continue; }
+            inject_text(&text);
+        }
+    });
+    *TEXT_WORKER.lock() = Some(handle);
+}
+
+/// 逐字注入文本。每个字之间检查一次停止标志，停止时最多再等一个字的时间。
+fn inject_text(text: &str) {
+    if !SYNC_CLIPBOARD.load(Ordering::Relaxed) { return; }
+
+    let master = HWND(MASTER_HWND.load(Ordering::Relaxed) as *mut _);
+    for slave in live_slaves() {
+        if !SYNC_ACTIVE.load(Ordering::Relaxed) { return; }
+        unsafe { let _ = SetForegroundWindow(slave); }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        for ch in text.chars() {
+            if !SYNC_ACTIVE.load(Ordering::Relaxed) { return; }
+            unsafe { send_unicode_char(ch as u32); }
+            // 字符间隔：防止游戏端队列溢出
+            std::thread::sleep(std::time::Duration::from_millis(6));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // 归还焦点到主窗口
+    if unsafe { IsWindow(master).as_bool() } {
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        unsafe { let _ = SetForegroundWindow(master); }
+    }
+}
+
+/// 记录鼠标键的按下 / 抬起，供补投抬起时使用。
+fn note_button(msg: u32, down: bool) {
+    let mask = match msg {
+        WM_LBUTTONDOWN | WM_LBUTTONUP => BTN_LEFT,
+        WM_RBUTTONDOWN | WM_RBUTTONUP => BTN_RIGHT,
+        _ => BTN_MIDDLE,
+    };
+
+    let mut state = PRESSED.lock();
+    if down {
+        state.button_down(mask);
+    } else {
+        state.button_up(mask);
+    }
+}
+
+/// 主窗口失焦 / 停止时的兜底：把还按着的键放掉。
+fn flush_pressed(reason: &str) {
+    let (keys, buttons) = PRESSED.lock().drain();
+    if keys.is_empty() && buttons == 0 { return; }
+
+    let count = keys.len() + buttons.count_ones() as usize;
+
+    match bus() {
+        // 走队列是为了排在已入队的按下事件之后：先补抬起再投 KeyDown，等于没补
+        Some(bus) => bus.push_reliable(Reliable::Release { keys, buttons }),
+        None => post_release(&keys, buttons),
+    }
+
+    log(&format!("{reason}：已补投抬起 {count} 个按键 / 鼠标键"));
+}
+
+/// 控制权已经不在主窗口、但还有键按着 —— 之后的消息不会再转发，不主动放就是永久卡键。
+fn flush_if_focus_lost() {
+    if PRESSED.lock().is_empty() { return; }
+
+    let master = HWND(MASTER_HWND.load(Ordering::Relaxed) as *mut _);
+    if unsafe { GetForegroundWindow() } == master { return; }
+
+    // 多余的抬起消息对接收方无副作用，所以这里不必区分「焦点去了从窗口（我们自己在注入文本）」
+    // 还是「用户切走了」—— 只要还有按着的键就补一次。
+    flush_pressed("控制权已离开主窗口");
+}
+
+/// 失焦兜底不能只靠钩子：用户 Alt+Tab 走开之后可能一个输入事件都不再产生。
+/// 所以再加一个轻量看门狗；30ms 一片睡眠，停止时 join 最多等这么久。
+fn start_focus_watch(bus: Arc<EventBus>) {
+    let handle = std::thread::spawn(move || {
+        while !bus.is_closed() {
+            for _ in 0..5 {
+                if bus.is_closed() { return; }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            if !SYNC_ACTIVE.load(Ordering::Relaxed) { continue; }
+            flush_if_focus_lost();
+        }
+    });
+    *FOCUS_WATCH.lock() = Some(handle);
+}
+
+/// 停掉工作线程并等它们把队列排空。`close()` 之后消费者会先取完剩余事件再退出。
+fn join_worker(slot: &Lazy<Mutex<Option<JoinHandle<()>>>>) {
+    if let Some(handle) = slot.lock().take() {
+        let _ = handle.join();
+    }
 }
 
 #[inline]
@@ -443,9 +611,8 @@ fn map_client_point(x: i32, y: i32, src_w: i32, src_h: i32, target: HWND) -> (i3
 // ── start_sync ────────────────────────────────────────────────────────────
 pub fn start_sync(config: SyncConfig) -> Result<String, String> {
     if SYNC_ACTIVE.load(Ordering::Relaxed) {
-        remove_hooks();
-        SYNC_ACTIVE.store(false, Ordering::Relaxed);
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // 重启：走一遍正常停止流程，把残留按键放掉、线程收干净
+        let _ = stop_sync();
     }
     if config.master_hwnd == 0       { return Err("请先选择主窗口".into()); }
     if config.slave_hwnds.is_empty() { return Err("请至少选择一个从窗口".into()); }
@@ -458,9 +625,16 @@ pub fn start_sync(config: SyncConfig) -> Result<String, String> {
     // 重置剪贴板哈希，避免误触发旧内容
     *LAST_CB_HASH.lock() = 0;
 
-    let (tx, rx) = mpsc::sync_channel::<SyncEvent>(2048);
-    *TX.lock() = Some(SendTx(tx));
-    start_worker(rx);
+    // 每次启动都是一套新的总线与工作线程，旧的在 stop 里已经收干净
+    let bus = Arc::new(EventBus::new());
+    *BUS.lock() = Some(bus.clone());
+    *PRESSED.lock() = PressedState::default();
+    *LAST_STATUS.lock() = String::new();
+    *LAST_POS.lock() = Pos::default();
+
+    start_input_worker(bus.clone());
+    start_text_worker(bus.clone());
+    start_focus_watch(bus.clone());
     start_clipboard_monitor();
 
     unsafe {
@@ -485,11 +659,37 @@ pub fn start_sync(config: SyncConfig) -> Result<String, String> {
 }
 
 pub fn stop_sync() -> Result<String, String> {
+    // 顺序很关键：先摘钩子（不再有新事件进来），再补抬起，最后关总线等线程退出。
+    // 反过来的话，补抬起之后仍可能有排队的 KeyDown 落地，从窗口照样卡键。
     remove_hooks();
     SYNC_ACTIVE.store(false, Ordering::Relaxed);
     text_mirror::set_enabled(false);
     text_mirror::shutdown();
-    log("同步已停止");
+
+    let (keys, buttons) = PRESSED.lock().drain();
+    let has_pressed = !keys.is_empty() || buttons != 0;
+
+    if let Some(bus) = BUS.lock().take() {
+        if has_pressed {
+            // 走可靠队列：它会排在所有已入队的 KeyDown 之后投出去
+            bus.push_reliable(Reliable::Release { keys, buttons });
+        }
+        bus.close();
+    }
+
+    // join 是为了让「补抬起」真的投完再返回：调用方拿到「已停止」时，
+    // 从窗口的按键状态一定已经复原了。
+    join_worker(&INPUT_WORKER);
+    join_worker(&TEXT_WORKER);
+    join_worker(&FOCUS_WATCH);
+
+    PRESSED.lock().drain();
+
+    if has_pressed {
+        log("同步已停止：已补投抬起所有按住的按键");
+    } else {
+        log("同步已停止");
+    }
     emit_status();
     Ok("同步已停止".into())
 }
@@ -540,26 +740,42 @@ unsafe extern "system" fn ms_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT 
     if code >= 0 && SYNC_ACTIVE.load(Ordering::Relaxed) && SYNC_MOUSE.load(Ordering::Relaxed) {
         let ms     = &*(lp.0 as *const MSLLHOOKSTRUCT);
         let master = HWND(MASTER_HWND.load(Ordering::Relaxed) as *mut _);
+
+        // 鼠标移动频率太高，不为它多做一次窗口查询；按键类事件顺带看看是不是已经失焦
+        if wp.0 as u32 != WM_MOUSEMOVE {
+            flush_if_focus_lost();
+        }
         if GetForegroundWindow() == master {
-            // 钩子只管采数，不做任何换算 —— 换算要按「每个从窗口自己的客户区」来算，
+            // 钩子只采数，不做任何换算 —— 换算要按「每个从窗口自己的客户区」来算，
             // 放在这里只能按主窗口算，滚轮与不同尺寸窗口都会出错。
-            let screen_x = ms.pt.x;
-            let screen_y = ms.pt.y;
             let mut pt = POINT { x: ms.pt.x, y: ms.pt.y };
             let _ = ScreenToClient(master, &mut pt);
             let (master_w, master_h) = client_size(master).unwrap_or((0, 0));
-            let msg = wp.0 as u32;
-            let wd  = if msg == WM_MOUSEWHEEL { (ms.mouseData >> 16) as i16 } else { 0 };
-            enqueue(SyncEvent::Mouse {
-                rel_x: pt.x,
-                rel_y: pt.y,
+            let pos = Pos {
+                x: pt.x,
+                y: pt.y,
+                screen_x: ms.pt.x,
+                screen_y: ms.pt.y,
                 master_w,
                 master_h,
-                screen_x,
-                screen_y,
-                msg,
-                wheel_delta: wd,
-            });
+            };
+
+            let msg = wp.0 as u32;
+            if let Some(bus) = bus() {
+                match msg {
+                    WM_MOUSEMOVE => bus.push_move(pos),
+                    WM_MOUSEWHEEL => bus.push_wheel((ms.mouseData >> 16) as i16, pos),
+                    WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+                        note_button(msg, true);
+                        bus.push_reliable(Reliable::Button { msg, pos });
+                    }
+                    WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
+                        note_button(msg, false);
+                        bus.push_reliable(Reliable::Button { msg, pos });
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     CallNextHookEx(None, code, wp, lp)
@@ -572,6 +788,11 @@ unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT 
     if code >= 0 && SYNC_ACTIVE.load(Ordering::Relaxed) {
         let kb     = &*(lp.0 as *const KBDLLHOOKSTRUCT);
         let master = HWND(MASTER_HWND.load(Ordering::Relaxed) as *mut _);
+
+        // 按住键 Alt+Tab 切走时，之后的抬起不会再转发（下面那句 if 挡住了）。
+        // 在这里补一次抬起，避免从窗口永久卡键。
+        flush_if_focus_lost();
+
         if GetForegroundWindow() == master {
             let n  = wp.0 as u32;
             let vk = kb.vkCode;
@@ -607,7 +828,10 @@ unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                             if *last == hash { return; }
                             *last = hash;
                             log(&format!("剪贴板中转：{} 个字符", text.chars().count()));
-                            enqueue(SyncEvent::ClipboardText { text });
+                            let pushed = bus().map(|b| b.push_text(text)).unwrap_or(false);
+                            if !pushed {
+                                log("文本队列已满，本次剪贴板内容未同步");
+                            }
                         }
                     });
                 }
@@ -615,9 +839,16 @@ unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT 
 
             if SYNC_KEYBOARD.load(Ordering::Relaxed) {
                 if n == WM_KEYDOWN || n == WM_SYSKEYDOWN {
-                    enqueue(SyncEvent::KeyDown { vk, scan: kb.scanCode });
+                    PRESSED.lock().key_down(vk, kb.scanCode);
+                    if let Some(bus) = bus() {
+                        bus.push_reliable(Reliable::Key { down: true, vk, scan: kb.scanCode });
+                    }
                 } else if n == WM_KEYUP || n == WM_SYSKEYUP {
-                    enqueue(SyncEvent::KeyUp { vk, scan: kb.scanCode });
+                    // 抬起无条件记账：即便总线已经关了，状态表也不能留脏数据
+                    PRESSED.lock().key_up(vk);
+                    if let Some(bus) = bus() {
+                        bus.push_reliable(Reliable::Key { down: false, vk, scan: kb.scanCode });
+                    }
                 }
             }
         }
@@ -867,6 +1098,156 @@ mod tests {
             assert_eq!((lp_x(lp), lp_y(lp)), (137, 246), "消息 {msg:#06X} 的 lParam 不是客户区坐标");
             assert_eq!(wp.0, expected_wp, "消息 {msg:#06X} 的 wParam 不对");
         }
+    }
+
+    // ── 端到端：投递路径（真实窗口 + 真实 PostMessage）────────────────────
+    //
+    // 上面那些测的是「生成什么」；这里测「到底投出去没有」。
+    // 丢「抬起」正是用户报的那个 bug 的核心：队列满了抬起被扔，从窗口永久按键。
+
+    /// 这些用例共用 `SLAVES` / `RECEIVED` 等全局状态，并行跑会互相串扰，必须串行。
+    /// （单独跑某个用例时它是绿的，一起跑就红 —— 就是并行闹的。）
+    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    /// 用来接消息的窗口：所有收到的消息都记到这个静态表里
+    static RECEIVED: Lazy<Mutex<Vec<(u32, usize, isize)>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+    unsafe extern "system" fn record_wndproc(
+        hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+    ) -> LRESULT {
+        RECEIVED.lock().push((msg, wparam.0, lparam.0));
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    unsafe fn recording_window() -> TestWindow {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE, MSG};
+
+        let class = w!("LxSyncRecordWindow");
+        let instance: windows::Win32::Foundation::HINSTANCE =
+            unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(record_wndproc),
+            hInstance: instance,
+            lpszClassName: class,
+            ..Default::default()
+        };
+        let _ = unsafe { RegisterClassW(&wc) };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                class,
+                w!("rec"),
+                WS_POPUP,
+                700, 400, 320, 240,
+                None, None, instance,
+                None,
+            )
+        }
+        .unwrap();
+
+        // 建窗口时系统会塞 WM_CREATE 之类的东西，先清一遍
+        unsafe {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE).as_bool() {}
+        }
+        RECEIVED.lock().clear();
+        TestWindow(hwnd)
+    }
+
+    /// 把本线程队列里的消息真正派发到窗口过程。
+    ///
+    /// 只 PeekMessage 是不够的：那样只是把消息从队列里取出来，窗口过程根本不会被调用，
+    /// 记录表永远是空的（第一版就是这么写错的）。
+    fn pump() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, MSG, PM_REMOVE,
+        };
+        // 不调 TranslateMessage：那会把 WM_KEYDOWN 再翻出一个 WM_CHAR，
+        // 记录表里就会多出不该有的消息，断言没法写死。
+        unsafe {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    fn received_msgs() -> Vec<u32> {
+        pump();
+        RECEIVED.lock().iter().map(|(m, _, _)| *m).collect()
+    }
+
+    /// 把本测试窗口设为唯一从窗口，测试结束后清空，避免污染其它用例
+    fn with_slave<F: FnOnce()>(hwnd: HWND, body: F) {
+        *SLAVES.lock() = vec![hwnd.0 as isize as i64];
+        body();
+        *SLAVES.lock() = vec![];
+        PRESSED.lock().drain();
+    }
+
+    #[test]
+    fn key_down_and_up_reach_the_slave_window() {
+        let _guard = TEST_LOCK.lock();
+        let slave = unsafe { recording_window() };
+        with_slave(slave.0, || {
+            post_key(true, 0x41, 0x1E);
+            post_key(false, 0x41, 0x1E);
+        });
+
+        let msgs = received_msgs();
+        assert_eq!(msgs, vec![WM_KEYDOWN, WM_KEYUP], "按下与抬起都必须真的投出去");
+    }
+
+    /// 停止同步时补投的抬起，必须落到从窗口上 —— 这是「从窗口一直以为鼠标按着」的修复点
+    #[test]
+    fn release_message_reaches_slave_for_keys_and_buttons() {
+        let _guard = TEST_LOCK.lock();
+        let slave = unsafe { recording_window() };
+        with_slave(slave.0, || {
+            // 模拟「按着 A 和左键，然后停止同步」
+            PRESSED.lock().key_down(0x41, 0x1E);
+            PRESSED.lock().button_down(BTN_LEFT);
+
+            let (keys, buttons) = PRESSED.lock().drain();
+            assert_eq!(keys, vec![(0x41, 0x1E)]);
+            assert_eq!(buttons, BTN_LEFT);
+
+            post_release(&keys, buttons);
+        });
+
+        let msgs = received_msgs();
+        assert!(msgs.contains(&WM_KEYUP), "按键抬起没有投递：{msgs:?}");
+        assert!(msgs.contains(&WM_LBUTTONUP), "鼠标抬起没有投递：{msgs:?}");
+    }
+
+    /// 失焦 / 停止时的兜底入口：`flush_pressed` 在没有总线的情况下直接投递
+    #[test]
+    fn flush_pressed_posts_release_without_bus() {
+        let _guard = TEST_LOCK.lock();
+        let slave = unsafe { recording_window() };
+        with_slave(slave.0, || {
+            PRESSED.lock().key_down(0x20, 0x39); // 空格
+            assert!(bus().is_none(), "本用例前提是没有启动同步");
+
+            flush_pressed("测试");
+        });
+
+        assert!(received_msgs().contains(&WM_KEYUP), "补投抬起没有落地");
+        assert!(PRESSED.lock().is_empty(), "补投之后状态表必须清空");
+    }
+
+    /// 鼠标键状态：按下记位、抬起清位，且不会把别的键位带掉
+    #[test]
+    fn note_button_tracks_mask() {
+        let _guard = TEST_LOCK.lock();
+        PRESSED.lock().drain();
+        note_button(WM_LBUTTONDOWN, true);
+        note_button(WM_RBUTTONDOWN, true);
+        assert_eq!(PRESSED.lock().drain().1, BTN_LEFT | BTN_RIGHT);
+
+        note_button(WM_LBUTTONDOWN, true);
+        note_button(WM_LBUTTONUP, false);
+        assert_eq!(PRESSED.lock().drain(), (vec![], 0));
     }
 
     #[test]
