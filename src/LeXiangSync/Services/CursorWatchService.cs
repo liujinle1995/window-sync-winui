@@ -254,17 +254,20 @@ public sealed partial class CursorWatchService : IDisposable
 
         if (targets.Count == 0) return;
 
-        // 坐标沿用核心转发鼠标时的那套：主窗口客户区坐标塞进 lParam
+        // 坐标沿用核心转发鼠标时的那套：lParam 放客户区坐标（滚轮才用屏幕坐标）。
+        // 这里先取主窗口客户区坐标，再按每个从窗口的客户区比例换算 —— 尺寸不一致时
+        // 直接沿用主窗口的值会把抬起消息投到从窗口边缘之外。
         var client = _lastCursor;
         ScreenToClient(master, ref client);
-        if (client.X < 0) client.X = 0;
-        if (client.Y < 0) client.Y = 0;
-        var mouseLp = (IntPtr)(((client.Y & 0xFFFF) << 16) | (client.X & 0xFFFF));
+        var (masterW, masterH) = ClientSize(master);
 
         var parts = new List<string>();
 
         foreach (var target in targets)
         {
+            var point = MapPoint(client, masterW, masterH, target);
+            var mouseLp = (IntPtr)(((point.Y & 0xFFFF) << 16) | (point.X & 0xFFFF));
+
             if ((_heldMouse & BtnLeft) != 0) PostMessageA(target, WM_LBUTTONUP, UIntPtr.Zero, mouseLp);
             if ((_heldMouse & BtnRight) != 0) PostMessageA(target, WM_RBUTTONUP, UIntPtr.Zero, mouseLp);
             if ((_heldMouse & BtnMiddle) != 0) PostMessageA(target, WM_MBUTTONUP, UIntPtr.Zero, mouseLp);
@@ -297,6 +300,29 @@ public sealed partial class CursorWatchService : IDisposable
         _ => $"0x{vk:X2}",
     };
 
+    /// <summary>客户区尺寸；取不到（窗口已销毁 / 最小化）时返回 (0, 0)。</summary>
+    private static (int Width, int Height) ClientSize(IntPtr hwnd)
+        => GetClientRect(hwnd, out var rect)
+            ? (rect.Right - rect.Left, rect.Bottom - rect.Top)
+            : (0, 0);
+
+    /// <summary>
+    /// 按客户区比例把主窗口坐标换算到目标窗口。两端尺寸一致时原值返回；
+    /// 任一侧尺寸未知（0）时也原值返回，宁可偏一点也不要全部压到左上角。
+    /// </summary>
+    private static POINT MapPoint(POINT point, int srcWidth, int srcHeight, IntPtr target)
+    {
+        if (srcWidth <= 0 || srcHeight <= 0) return point;
+
+        var (dstWidth, dstHeight) = ClientSize(target);
+        if (dstWidth <= 0 || dstHeight <= 0) return point;
+        if (dstWidth == srcWidth && dstHeight == srcHeight) return point;
+
+        var x = (int)Math.Round(point.X * (double)dstWidth / srcWidth);
+        var y = (int)Math.Round(point.Y * (double)dstHeight / srcHeight);
+        return new POINT { X = Math.Clamp(x, 0, dstWidth - 1), Y = Math.Clamp(y, 0, dstHeight - 1) };
+    }
+
     public void Dispose() => _timer.Stop();
 
     [StructLayout(LayoutKind.Sequential)]
@@ -326,6 +352,10 @@ public sealed partial class CursorWatchService : IDisposable
 
     [LibraryImport("user32.dll")]
     private static partial int ScreenToClient(IntPtr hwnd, ref POINT point);
+
+    [LibraryImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetClientRect(IntPtr hwnd, out RECT rect);
 
     [LibraryImport("user32.dll")]
     private static partial short GetAsyncKeyState(int vKey);

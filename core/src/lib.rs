@@ -1,5 +1,8 @@
 //! 乐享同步操作 — 核心逻辑
-//! 鼠标同步：PostMessageA 客户区坐标，不移动系统光标
+//! 鼠标同步：PostMessageA 投递，不移动系统光标。坐标系按消息类型区分：
+//!   - `WM_MOUSEMOVE` / 左右中键：**目标窗口客户区**坐标
+//!   - `WM_MOUSEWHEEL`：**屏幕**坐标（lParam 的约定，塞客户区坐标会偏）
+//!   - 主/从窗口客户区尺寸不同时，按客户区比例换算，保证落在同一个相对位置
 //! 键盘同步：PostMessageA WM_KEYDOWN/WM_KEYUP
 //! 中文同步：见 `text_mirror` 模块 —— 读主窗口焦点控件文本做 diff，再用 WM_CHAR 投递给从窗口
 //!
@@ -17,8 +20,8 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use windows::Win32::Foundation::{BOOL, HWND, HGLOBAL, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::Foundation::{BOOL, HWND, HGLOBAL, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -33,7 +36,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_UNICODE, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumWindows, GetForegroundWindow, GetWindowLongA, GetWindowTextW,
+    CallNextHookEx, EnumWindows, GetClientRect, GetForegroundWindow, GetWindowLongA, GetWindowTextW,
     GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageA, SetForegroundWindow,
     SetWindowsHookExA, ShowWindow, UnhookWindowsHookEx, GWL_STYLE, HHOOK, KBDLLHOOKSTRUCT,
     MSLLHOOKSTRUCT, SW_RESTORE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
@@ -74,7 +77,20 @@ unsafe impl Sync for SafeHook {}
 
 #[derive(Debug, Clone)]
 enum SyncEvent {
-    Mouse         { rel_x: i32, rel_y: i32, msg: u32, wheel_delta: i16 },
+    /// 鼠标事件。坐标同时带三套，因为三种消息要的坐标系不同（见 worker 里的注释）：
+    /// - `rel_x / rel_y`：主窗口**客户区**坐标，供移动与按键消息使用
+    /// - `master_w / master_h`：主窗口客户区尺寸，用来给不同大小的从窗口做比例映射
+    /// - `screen_x / screen_y`：原始**屏幕**坐标，滚轮兜底用
+    Mouse {
+        rel_x: i32,
+        rel_y: i32,
+        master_w: i32,
+        master_h: i32,
+        screen_x: i32,
+        screen_y: i32,
+        msg: u32,
+        wheel_delta: i16,
+    },
     KeyDown       { vk: u32, scan: u32 },
     KeyUp         { vk: u32, scan: u32 },
     ClipboardText { text: String },   // 剪贴板中转：把文本逐字注入从窗口
@@ -277,25 +293,22 @@ fn start_worker(rx: Receiver<SyncEvent>) {
             let slaves: Vec<i64> = SLAVES.lock().clone();
             unsafe {
                 match ev {
-                    SyncEvent::Mouse { rel_x, rel_y, msg, wheel_delta } => {
+                    SyncEvent::Mouse {
+                        rel_x, rel_y, master_w, master_h, screen_x, screen_y, msg, wheel_delta,
+                    } => {
                         if !SYNC_MOUSE.load(Ordering::Relaxed) { continue; }
-                        let lp = make_lp(rel_x, rel_y);
                         for &h in &slaves {
                             let s = HWND(h as *mut _);
                             if !IsWindow(s).as_bool() { continue; }
-                            match msg {
-                                m if m == WM_MOUSEMOVE   => { let _ = PostMessageA(s, WM_MOUSEMOVE,   WPARAM(0),        lp); }
-                                m if m == WM_LBUTTONDOWN => { let _ = PostMessageA(s, WM_LBUTTONDOWN, WPARAM(0x0001),   lp); }
-                                m if m == WM_LBUTTONUP   => { let _ = PostMessageA(s, WM_LBUTTONUP,   WPARAM(0),        lp); }
-                                m if m == WM_RBUTTONDOWN => { let _ = PostMessageA(s, WM_RBUTTONDOWN, WPARAM(0x0002),   lp); }
-                                m if m == WM_RBUTTONUP   => { let _ = PostMessageA(s, WM_RBUTTONUP,   WPARAM(0),        lp); }
-                                m if m == WM_MBUTTONDOWN => { let _ = PostMessageA(s, WM_MBUTTONDOWN, WPARAM(0x0010),   lp); }
-                                m if m == WM_MBUTTONUP   => { let _ = PostMessageA(s, WM_MBUTTONUP,   WPARAM(0),        lp); }
-                                m if m == WM_MOUSEWHEEL  => {
-                                    let wp = ((wheel_delta as u32) << 16) as usize;
-                                    let _ = PostMessageA(s, WM_MOUSEWHEEL, WPARAM(wp), lp);
-                                }
-                                _ => {}
+
+                            // 每个从窗口单独换算：客户区尺寸可能和主窗口不一样，
+                            // 直接沿用主窗口的坐标会在边缘处偏出去（点不中同一个按钮）。
+                            let (x, y) = map_client_point(rel_x, rel_y, master_w, master_h, s);
+
+                            if let Some((wp, lp)) =
+                                mouse_message(msg, x, y, screen_x, screen_y, wheel_delta, s)
+                            {
+                                let _ = PostMessageA(s, msg, wp, lp);
                             }
                         }
                     }
@@ -351,6 +364,82 @@ fn start_worker(rx: Receiver<SyncEvent>) {
 #[inline]
 fn make_lp(x: i32, y: i32) -> LPARAM {
     LPARAM((((y as u16 as u32) << 16) | (x as u16 as u32)) as isize)
+}
+
+/// 生成要投递给从窗口的 `(wParam, lParam)`。坐标系按消息类型区分，这是本模块最容易搞错的地方：
+///
+/// | 消息 | lParam 坐标系 |
+/// |---|---|
+/// | `WM_MOUSEMOVE`、左右中键的按下 / 抬起 | 目标窗口**客户区**坐标 |
+/// | `WM_MOUSEWHEEL` | **屏幕**坐标 |
+///
+/// 滚轮如果也塞客户区坐标，接收方会把它当成屏幕点，结果按「客户区原点」整体偏移一段 ——
+/// 窗口一挪位置就会滚到别的控件上。这里把映射后的客户区点再用 `ClientToScreen`
+/// 转回从窗口的屏幕坐标，保证落点仍在从窗口客户区内。
+///
+/// 不认识的消息返回 `None`（调用方跳过，不要投递）。
+fn mouse_message(
+    msg: u32,
+    x: i32,
+    y: i32,
+    screen_x: i32,
+    screen_y: i32,
+    wheel_delta: i16,
+    slave: HWND,
+) -> Option<(WPARAM, LPARAM)> {
+    let client = || make_lp(x, y);
+
+    Some(match msg {
+        WM_MOUSEMOVE => (WPARAM(0), client()),
+        WM_LBUTTONDOWN => (WPARAM(0x0001), client()), // MK_LBUTTON
+        WM_LBUTTONUP => (WPARAM(0), client()),
+        WM_RBUTTONDOWN => (WPARAM(0x0002), client()), // MK_RBUTTON
+        WM_RBUTTONUP => (WPARAM(0), client()),
+        WM_MBUTTONDOWN => (WPARAM(0x0010), client()), // MK_MBUTTON
+        WM_MBUTTONUP => (WPARAM(0), client()),
+        WM_MOUSEWHEEL => {
+            // 高 16 位是滚动量（有符号，向上为正）
+            let wp = WPARAM(((wheel_delta as u32) << 16) as usize);
+            let mut point = POINT { x, y };
+            let lp = if unsafe { ClientToScreen(slave, &mut point) }.as_bool() {
+                make_lp(point.x, point.y)
+            } else {
+                // 转不回屏幕坐标时退回原始屏幕坐标：位置会偏，但坐标系至少是对的
+                make_lp(screen_x, screen_y)
+            };
+            (wp, lp)
+        }
+        _ => return None,
+    })
+}
+
+/// 客户区尺寸。取不到（窗口已销毁 / 最小化到 0）时返回 `None`，调用方按「不缩放」处理。
+fn client_size(h: HWND) -> Option<(i32, i32)> {
+    let mut rect = RECT::default();
+    if unsafe { GetClientRect(h, &mut rect) }.is_ok() {
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        if w > 0 && h > 0 { return Some((w, h)); }
+    }
+    None
+}
+
+/// 把主窗口客户区坐标按**客户区比例**映射到从窗口客户区坐标。
+///
+/// 两端尺寸一致时就是原值，不做任何取整误差；一侧尺寸未知或为 0 时退回原值，
+/// 保证「拿不到尺寸」也不会把坐标算成负数或者 0 导致全部点左上角。
+#[inline]
+fn map_client_point(x: i32, y: i32, src_w: i32, src_h: i32, target: HWND) -> (i32, i32) {
+    {
+        let Some((dst_w, dst_h)) = client_size(target) else { return (x, y) };
+        if src_w <= 0 || src_h <= 0 { return (x, y); }
+        if src_w == dst_w && src_h == dst_h { return (x, y); }
+
+        let nx = (x as f64 / src_w as f64 * dst_w as f64).round() as i32;
+        let ny = (y as f64 / src_h as f64 * dst_h as f64).round() as i32;
+        // 夹在客户区内：比例换算后可能因为取整落在右/下边界外一像素
+        (nx.clamp(0, dst_w - 1), ny.clamp(0, dst_h - 1))
+    }
 }
 
 // ── start_sync ────────────────────────────────────────────────────────────
@@ -454,11 +543,25 @@ unsafe extern "system" fn ms_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT 
         let ms     = &*(lp.0 as *const MSLLHOOKSTRUCT);
         let master = HWND(MASTER_HWND.load(Ordering::Relaxed) as *mut _);
         if GetForegroundWindow() == master {
+            // 钩子只管采数，不做任何换算 —— 换算要按「每个从窗口自己的客户区」来算，
+            // 放在这里只能按主窗口算，滚轮与不同尺寸窗口都会出错。
+            let screen_x = ms.pt.x;
+            let screen_y = ms.pt.y;
             let mut pt = POINT { x: ms.pt.x, y: ms.pt.y };
             let _ = ScreenToClient(master, &mut pt);
+            let (master_w, master_h) = client_size(master).unwrap_or((0, 0));
             let msg = wp.0 as u32;
             let wd  = if msg == WM_MOUSEWHEEL { (ms.mouseData >> 16) as i16 } else { 0 };
-            enqueue(SyncEvent::Mouse { rel_x: pt.x, rel_y: pt.y, msg, wheel_delta: wd });
+            enqueue(SyncEvent::Mouse {
+                rel_x: pt.x,
+                rel_y: pt.y,
+                master_w,
+                master_h,
+                screen_x,
+                screen_y,
+                msg,
+                wheel_delta: wd,
+            });
         }
     }
     CallNextHookEx(None, code, wp, lp)
@@ -589,5 +692,188 @@ pub fn kill_process_by_name(exe_name: String) -> Result<u32, String> {
         }
         let _ = windows::Win32::Foundation::CloseHandle(snap);
         Ok(killed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::w;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WNDCLASSW, WS_POPUP,
+    };
+
+    /// 测试窗口：`WS_POPUP` 没有边框和标题栏，客户区尺寸就精确等于创建时给的尺寸，
+    /// 这样断言里的期望值可以直接写死，不必再去减一遍边框宽度。
+    struct TestWindow(HWND);
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            unsafe { let _ = DestroyWindow(self.0); }
+        }
+    }
+
+    // DefWindowProcW 在 0.58 里是泛型函数，不能直接当 WNDPROC 指针用，包一层
+    unsafe extern "system" fn test_wndproc(
+        hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    unsafe fn popup(x: i32, y: i32, w: i32, h: i32) -> TestWindow {
+        let class = w!("LxSyncCoordTestWindow");
+        let instance: windows::Win32::Foundation::HINSTANCE =
+            unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(test_wndproc),
+            hInstance: instance,
+            lpszClassName: class,
+            ..Default::default()
+        };
+        // 同一个进程里注册第二次会返回 0，类已经存在照样能用，所以不看返回值
+        let _ = unsafe { RegisterClassW(&wc) };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                class,
+                w!("test"),
+                WS_POPUP,
+                x, y, w, h,
+                None, None, instance,
+                None,
+            )
+        }.unwrap();
+        TestWindow(hwnd)
+    }
+
+    #[test]
+    fn client_size_matches_popup_size() {
+        let window = unsafe { popup(100, 100, 400, 300) };
+        assert_eq!(client_size(window.0), Some((400, 300)));
+    }
+
+    #[test]
+    fn same_size_keeps_point() {
+        let slave = unsafe { popup(1000, 400, 400, 300) };
+        assert_eq!(map_client_point(120, 90, 400, 300, slave.0), (120, 90));
+    }
+
+    #[test]
+    fn downscale_maps_proportionally() {
+        // 主窗口 1000×600 的中心 → 从窗口 500×300 的中心
+        let slave = unsafe { popup(1000, 400, 500, 300) };
+        assert_eq!(map_client_point(500, 300, 1000, 600, slave.0), (250, 150));
+
+        // 四分之一位置同样要成比例
+        assert_eq!(map_client_point(250, 150, 1000, 600, slave.0), (125, 75));
+    }
+
+    #[test]
+    fn upscale_maps_proportionally() {
+        // 主窗口 500×300 的右下角内侧 → 从窗口 1000×600 的对应点
+        let slave = unsafe { popup(1000, 400, 1000, 600) };
+        assert_eq!(map_client_point(499, 299, 500, 300, slave.0), (998, 598));
+    }
+
+    #[test]
+    fn clamps_inside_target_client_area() {
+        // 主窗口最后一个像素按比例放大后会落在从窗口右/下边界外，必须夹回来
+        let slave = unsafe { popup(1000, 400, 333, 111) };
+        let (x, y) = map_client_point(999, 599, 1000, 600, slave.0);
+        assert!(x < 333 && y < 111, "映射结果越界: ({x}, {y})");
+        assert_eq!((x, y), (332, 110));
+    }
+
+    #[test]
+    fn unknown_source_size_keeps_point() {
+        // 主窗口尺寸取不到（已销毁 / 最小化）时不做缩放，宁可偏一点也不压到左上角
+        let slave = unsafe { popup(1000, 400, 500, 300) };
+        assert_eq!(map_client_point(10, 20, 0, 0, slave.0), (10, 20));
+        assert_eq!(map_client_point(10, 20, -1, 600, slave.0), (10, 20));
+    }
+
+    /// 滚轮的 lParam 必须是**屏幕坐标**：换算后的客户区点要能转成从窗口的屏幕点，
+    /// 且这个点落在从窗口客户区内部（不能是主窗口那套坐标直接塞过去）。
+    #[test]
+    fn wheel_point_converts_to_slave_screen_coordinates() {
+        let slave = unsafe { popup(1200, 500, 400, 300) };
+
+        // 主窗口 1000×600 的中心 → 从窗口 400×300 的中心 (200, 150)
+        let (x, y) = map_client_point(500, 300, 1000, 600, slave.0);
+        assert_eq!((x, y), (200, 150));
+
+        let mut point = POINT { x, y };
+        let mut origin = POINT { x: 0, y: 0 };
+        unsafe {
+            assert!(ClientToScreen(slave.0, &mut point).as_bool());
+            assert!(ClientToScreen(slave.0, &mut origin).as_bool());
+        }
+
+        // ClientToScreen 是平移，减掉客户区原点应还原成客户区坐标
+        assert_eq!((point.x - origin.x, point.y - origin.y), (200, 150));
+
+        // 并且确实在客户区内
+        let (w, h) = client_size(slave.0).unwrap();
+        assert!(point.x >= origin.x && point.x < origin.x + w);
+        assert!(point.y >= origin.y && point.y < origin.y + h);
+    }
+
+    // ── 消息装配：直接测生产代码里真正用的 mouse_message ──────────────────
+
+    fn lp_x(lp: LPARAM) -> i32 { (lp.0 as u32 & 0xFFFF) as u16 as i16 as i32 }
+    fn lp_y(lp: LPARAM) -> i32 { ((lp.0 as u32 >> 16) & 0xFFFF) as u16 as i16 as i32 }
+
+    fn client_origin(hwnd: HWND) -> (i32, i32) {
+        let mut p = POINT { x: 0, y: 0 };
+        unsafe { assert!(ClientToScreen(hwnd, &mut p).as_bool()) };
+        (p.x, p.y)
+    }
+
+    #[test]
+    fn wheel_lparam_is_screen_coordinates() {
+        let slave = unsafe { popup(1200, 500, 400, 300) };
+        let (ox, oy) = client_origin(slave.0);
+
+        // 客户区点 (200,150) 的滚轮消息
+        let (wp, lp) =
+            mouse_message(WM_MOUSEWHEEL, 200, 150, 0, 0, 120, slave.0).unwrap();
+
+        // 落点 = 客户区原点 + 客户区坐标，绝不是把 (200,150) 直接塞进去
+        assert_eq!((lp_x(lp), lp_y(lp)), (ox + 200, oy + 150));
+        assert_ne!((lp_x(lp), lp_y(lp)), (200, 150), "滚轮不能沿用客户区坐标");
+
+        // 高 16 位是滚动量
+        assert_eq!((wp.0 as u32 >> 16) as u16 as i16, 120);
+    }
+
+    #[test]
+    fn negative_wheel_delta_keeps_sign() {
+        let slave = unsafe { popup(1200, 500, 400, 300) };
+        let (wp, _) = mouse_message(WM_MOUSEWHEEL, 10, 10, 0, 0, -120, slave.0).unwrap();
+        assert_eq!((wp.0 as u32 >> 16) as u16 as i16, -120);
+    }
+
+    #[test]
+    fn move_and_buttons_lparam_is_client_coordinates() {
+        let slave = unsafe { popup(1200, 500, 400, 300) };
+
+        for (msg, expected_wp) in [
+            (WM_MOUSEMOVE, 0usize),
+            (WM_LBUTTONDOWN, 0x0001),
+            (WM_LBUTTONUP, 0x0000),
+            (WM_RBUTTONDOWN, 0x0002),
+            (WM_MBUTTONDOWN, 0x0010),
+        ] {
+            let (wp, lp) = mouse_message(msg, 137, 246, 9999, 9999, 0, slave.0).unwrap();
+            assert_eq!((lp_x(lp), lp_y(lp)), (137, 246), "消息 {msg:#06X} 的 lParam 不是客户区坐标");
+            assert_eq!(wp.0, expected_wp, "消息 {msg:#06X} 的 wParam 不对");
+        }
+    }
+
+    #[test]
+    fn unknown_message_is_skipped() {
+        let slave = unsafe { popup(1200, 500, 400, 300) };
+        assert!(mouse_message(0x0200 + 0x99, 10, 10, 0, 0, 0, slave.0).is_none());
     }
 }

@@ -134,6 +134,7 @@ Views (XAML)  ──x:Bind──►  ViewModels  ──►  Services  ──P/In
 4. **双击最大化走的是非客户区消息**，XAML 的 `DoubleTapped` 收不到。要拦只能挂窗口过程（见 `Helpers/TitleBarDoubleClickGuard.cs`）；而且**不能直接吞掉** `WM_NCLBUTTONDBLCLK` —— 系统的双击序列没收尾，紧接着的第一次点击会被判成双击，表现为「双击过标题栏之后窗口拖不动了」。正确做法是把它降级成 `WM_NCLBUTTONDOWN` 转发。
 5. **迷你条的宽度要实测，不要写死。** 内容网格 `Measure(∞)` 拿真实宽度，再加「隐形窗口边框」（`AppWindow.Size - RootGrid.ActualWidth`，且必须在 `SetBorderAndTitleBar(false,false)` **之前**量）。写死只要比内容宽一点点，多出来的宽度就会被 `*` 列吃掉，堆成中间一段莫名其妙的空白。
 6. `OverlappedPresenter` 没有 `IsFullScreen` 属性，判全屏只能看 `Presenter is FullScreenPresenter` 再 `SetPresenter(AppWindowPresenterKind.Overlapped)`。
+7. **鼠标消息的坐标系是按消息类型分的**，混用会静默偏移：`WM_MOUSEMOVE` 与左右中键的 lParam 是**目标窗口客户区**坐标，而 `WM_MOUSEWHEEL` 的 lParam 是**屏幕**坐标。滚轮若塞客户区坐标，接收方会把它当屏幕点，整体偏移「客户区原点」那么远，窗口换个位置就滚到别的控件上。另外主从窗口客户区尺寸不同时要按比例换算，否则边缘区域点不中同一个按钮。见 `core/src/lib.rs` 的 `mouse_message` / `map_client_point`，对应单测在文件末尾。
 
 ## 已知限制
 
