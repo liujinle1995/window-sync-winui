@@ -329,8 +329,6 @@ public sealed class GameLaunchService
 
     private const uint WM_CLOSE = 0x0010;
 
-    private bool _ocrWarned;
-
     /// <summary>
     /// 关掉这一组沙箱里的客户端：先发 WM_CLOSE 请求正常退出，等 <see cref="GraceSeconds"/> 秒，
     /// 还赖着不走的按进程强杀（连进程树一起）。返回处理掉的窗口数。
