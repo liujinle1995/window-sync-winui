@@ -45,7 +45,8 @@ pub use control::{Capability, ControlId, ReadResult};
 use diff::Edit;
 use once_cell::sync::Lazy;
 use parking_lot::{Condvar, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use windows::Win32::Foundation::HWND;
@@ -65,14 +66,25 @@ const SUSPECT_KEYS: usize = 8;
 /// 空闲时每这么多拍做一次一致性校正（≈1 秒）
 const PARITY_EVERY: u32 = 8;
 
+/// 文本镜像总开关。**只有** `set_enabled` 写它，其它地方一律只读 ——
+/// 这是「现在该不该采样」的唯一判据，线程活没活着不再由它表达。
 static ENABLED: AtomicBool = AtomicBool::new(false);
-static RUNNING: AtomicBool = AtomicBool::new(false);
 /// 自上次文本变化以来，转发的可打印按键次数
 static PRINTABLE_KEYS: AtomicUsize = AtomicUsize::new(0);
 static WAKE: Lazy<(Mutex<bool>, Condvar)> = Lazy::new(|| (Mutex::new(false), Condvar::new()));
 static MASTER: Lazy<Mutex<Master>> = Lazy::new(|| Mutex::new(Master::default()));
 static SLAVES: Lazy<Mutex<Vec<SlaveTrack>>> = Lazy::new(|| Mutex::new(Vec::new()));
-static WORKER: Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
+/// 当前有效的采样线程代次。线程每轮拿自己的代次跟它比一次，不等就退。
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// 唯一一条采样线程。`None` 表示没有线程在跑。
+static WORKER: Lazy<Mutex<Option<Worker>>> = Lazy::new(|| Mutex::new(None));
+
+/// 一条采样线程的记录：它属于哪一代、被要求停下没有、以及句柄。
+struct Worker {
+    generation: u64,
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
 
 /// 主窗口当前焦点控件的状态
 #[derive(Default)]
@@ -136,26 +148,33 @@ enum SkipReason {
 
 /// 开关文本同步，返回状态是否真的变化了。关闭时清空全部基线。
 pub fn set_enabled(on: bool) -> bool {
-    if ENABLED.swap(on, Ordering::SeqCst) == on {
-        // 值没变也不能假设线程还在：宿主可能在「启动同步」之前就先设过一次开关，
-        // 也可能上一次的线程已经退掉。这里补一次 spawn（幂等），避免出现
-        // 「开关是开的、线程却没了」的静默失效。
-        if on {
-            spawn();
-        }
-        return false;
+    let changed = ENABLED.swap(on, Ordering::SeqCst) != on;
+    if changed {
+        reset_state();
     }
-    reset_state();
     if on {
-        spawn();
+        // 值没变也要补一次（幂等）：宿主可能在「启动同步」之前就先设过一次开关，
+        // 也可能上一次的线程已经退掉。`ensure_worker` 自己判断有没有必要起。
+        ensure_worker();
     } else {
+        // 关掉时不在这里 join：让线程看到开关关了之后自己在下一拍转入空转，
+        // 真正的回收交给 `shutdown()`。同步 join 会把「点一下开关」的调用方钉在这里。
         wake();
     }
-    true
+    changed
 }
 
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// 采样线程是否还在跑（诊断 / 测试用）。
+pub fn has_worker() -> bool {
+    WORKER
+        .lock()
+        .as_ref()
+        .map(|w| !w.handle.is_finished())
+        .unwrap_or(false)
 }
 
 // ── 给 FFI 的「文本缓冲区」通道用的薄封装 ────────────────────────────────
@@ -183,8 +202,11 @@ pub(crate) fn is_standard_control(hwnd: windows::Win32::Foundation::HWND) -> boo
 }
 
 /// 键盘钩子每转发一个键调一次：唤醒调度器；可打印字符额外计入「疑似自绘」统计。
+///
+/// 这里不再查「线程还活着吗」：唤醒只是个置位 + `notify`，没有线程在等也无害，
+/// 下一代的线程第一拍就会把它消费掉。少一个共享的存活标志，就少一处竞态。
 pub fn note_key(vk: u32) {
-    if !RUNNING.load(Ordering::Relaxed) {
+    if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
     if is_printable_vk(vk) {
@@ -195,17 +217,32 @@ pub fn note_key(vk: u32) {
 
 /// 剪贴板 / 焦点之类的其它触发源：只唤醒，不计数
 pub fn note_input() {
-    if RUNNING.load(Ordering::Relaxed) {
+    if ENABLED.load(Ordering::Relaxed) {
         wake();
     }
 }
 
-/// 停止同步时调用：让工作线程立刻退出并等它结束。
+/// 停止同步时调用：让采样线程立刻退出、等它结束，并清空基线。
+///
+/// 幂等 —— 没线程在跑时只做一次 `reset_state()`。
 pub fn shutdown() {
-    RUNNING.store(false, Ordering::SeqCst);
-    wake();
-    if let Some(handle) = WORKER.lock().take() {
-        let _ = handle.join();
+    ENABLED.store(false, Ordering::SeqCst);
+
+    // 全程持 WORKER 锁：`ensure_worker` 要拿同一把锁，所以不可能出现
+    // 「旧线程还在收尾、新线程已经开始跑」两代并存的画面。
+    let mut slot = WORKER.lock();
+    if let Some(w) = slot.take() {
+        // 把代次推到比它更大 —— 即便某个角落还留着旧线程的引用，它下一轮问
+        // 「我是不是当前这一代」也会得到「不是」。用 `fetch_max` 而不是 `fetch_add`，
+        // 是为了在并发停机时不会把代次来回拨动。
+        GENERATION.fetch_max(w.generation + 1, Ordering::SeqCst);
+        w.stop.store(true, Ordering::SeqCst);
+        wake();
+        if w.handle.thread().id() == thread::current().id() {
+            // 采样线程自己叫停自己（正常不会发生）：不能 join 自己，放生
+        } else {
+            let _ = w.handle.join();
+        }
     }
     reset_state();
 }
@@ -223,12 +260,44 @@ pub fn is_printable_vk(vk: u32) -> bool {
 }
 
 // ── 线程与唤醒 ───────────────────────────────────────────────────────────
+//
+// # 为什么用「代次」而不是一个 RUNNING 布尔
+// 老实现里 `RUNNING` 被三处共同修改（`spawn` 置 true、`shutdown` 置 false、
+// `set_enabled` 关闭时只唤醒）。快速「停 → 启」时会出两种错乱：
+//   - 旧线程还在收尾，`spawn()` 看到 `RUNNING` 仍是 true 就提前 return，
+//     新会话从头到尾没有采样线程 —— 静默失效，最难查；
+//   - 或者新会话已经把 `RUNNING` 置回 true，旧线程醒来误以为自己是当前线程，
+//     接着跑一轮，把刚清空的基线又写脏。
+// 现在「谁在跑」只看 `WORKER` 里那一条记录，记录自带代次与停止标志；
+// 线程每轮先问一句「我还是当前这一代吗」，不是就退。启停共用一把锁，
+// 所以任何时刻最多只有一条采样线程。
 
-fn spawn() {
-    if RUNNING.swap(true, Ordering::SeqCst) {
-        return;
+/// 起采样线程（幂等）。已有线程在跑就什么都不做；已退出的旧线程顺手回收。
+fn ensure_worker() {
+    let mut slot = WORKER.lock();
+
+    if let Some(w) = slot.as_ref() {
+        if !w.handle.is_finished() {
+            return;
+        }
     }
-    *WORKER.lock() = Some(thread::spawn(run));
+
+    // 走到这儿要么没线程，要么线程已经自己退干净了（join 会立即返回）
+    if let Some(old) = slot.take() {
+        let _ = old.handle.join();
+    }
+
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || run(generation, stop))
+    };
+    *slot = Some(Worker {
+        generation,
+        stop,
+        handle,
+    });
 }
 
 fn wake() {
@@ -254,11 +323,17 @@ fn reset_state() {
     PRINTABLE_KEYS.store(0, Ordering::Relaxed);
 }
 
-fn run() {
+/// 我这一代还有效吗？停止标志和代次任一失效都算「该退了」。
+#[inline]
+fn still_current(generation: u64, stop: &AtomicBool) -> bool {
+    !stop.load(Ordering::SeqCst) && GENERATION.load(Ordering::SeqCst) == generation
+}
+
+fn run(generation: u64, stop: Arc<AtomicBool>) {
     let mut sleep_ms = POLL_IDLE_MS;
-    while RUNNING.load(Ordering::SeqCst) {
+    while still_current(generation, &stop) {
         wait(sleep_ms);
-        if !RUNNING.load(Ordering::SeqCst) {
+        if !still_current(generation, &stop) {
             break;
         }
         if !ENABLED.load(Ordering::Relaxed) {

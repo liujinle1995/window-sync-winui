@@ -220,6 +220,9 @@ public sealed partial class SyncEngine : ObservableObject
         catch (NativeException ex)
         {
             _log.Add($"启动失败: {ex.Message}", LogLevel.Error);
+            // 引擎已经整体回滚了，把界面也拉回「未运行」——
+            // 否则上一次的成功状态会留在 UI 上，看起来像启动成功了一半。
+            RefreshStatus();
         }
     }
 

@@ -175,9 +175,9 @@ pub extern "C" fn wsync_panic_mode() -> u32 {
 
 /// 释放由本模块返回的字符串
 #[no_mangle]
-pub extern "C" fn wsync_free(s: *mut c_char) {
+pub unsafe extern "C" fn wsync_free(s: *mut c_char) {
     if !s.is_null() {
-        unsafe { drop(CString::from_raw(s)); }
+        drop(CString::from_raw(s));
     }
 }
 

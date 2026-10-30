@@ -16,7 +16,7 @@ use crate::test_support as ts;
 fn decode(p: *mut c_char) -> Value {
     assert!(!p.is_null(), "返回值不该是空指针");
     let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
-    wsync_free(p);
+    unsafe { wsync_free(p) };
     serde_json::from_str(&s).expect("返回值必须是合法 JSON")
 }
 

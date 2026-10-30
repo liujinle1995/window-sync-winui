@@ -15,6 +15,9 @@ pub mod event_bus;
 pub mod ffi;
 #[cfg(test)]
 mod ffi_tests;
+pub mod session;
+#[cfg(test)]
+mod session_tests;
 pub mod text_sync;
 pub mod window_id;
 pub mod window_watch;
@@ -48,8 +51,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, EnumWindows, GetForegroundWindow, GetWindowLongA, IsWindow, IsWindowVisible,
     PostMessageA, SetForegroundWindow,
-    SetWindowsHookExA, ShowWindow, UnhookWindowsHookEx, GWL_STYLE, HHOOK, KBDLLHOOKSTRUCT,
-    MSLLHOOKSTRUCT, SW_RESTORE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
+    ShowWindow, GWL_STYLE, KBDLLHOOKSTRUCT,
+    MSLLHOOKSTRUCT, SW_RESTORE, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_VISIBLE,
 };
@@ -167,36 +170,40 @@ pub fn log(msg: &str) {
     }
 }
 
-struct SafeHook(HHOOK);
-unsafe impl Send for SafeHook {}
-unsafe impl Sync for SafeHook {}
+// ── 全局状态 ─────────────────────────────────────────────────────────────
+//
+// 这些量之所以是全局的，是因为它们要被**钩子回调**读 —— 回调是系统在任意线程上
+// 直接调进来的，没有参数能带进去。它们的写入与还原由 `session::SyncSession`
+// 统一负责（建立时写、拆解时清），其余模块只读不写。
 
+pub(crate) static SYNC_ACTIVE:   AtomicBool = AtomicBool::new(false);
+pub(crate) static SYNC_MOUSE:    AtomicBool = AtomicBool::new(true);
+pub(crate) static SYNC_KEYBOARD: AtomicBool = AtomicBool::new(true);
+pub(crate) static MASTER_HWND:   AtomicI64  = AtomicI64::new(0);
 
-static SYNC_ACTIVE:    AtomicBool = AtomicBool::new(false);
-static SYNC_MOUSE:     AtomicBool = AtomicBool::new(true);
-static SYNC_KEYBOARD:  AtomicBool = AtomicBool::new(true);
-static MASTER_HWND:    AtomicI64  = AtomicI64::new(0);
+pub(crate) static SYNC_CLIPBOARD: AtomicBool = AtomicBool::new(false);
+/// 记录上次剪贴板内容的哈希，避免重复处理自己写入的内容
+pub(crate) static LAST_CB_HASH: Lazy<Mutex<u64>> = Lazy::new(|| Mutex::new(0));
 
-static SYNC_CLIPBOARD: AtomicBool = AtomicBool::new(false);
-// 记录上次剪贴板内容的哈希，避免重复处理自己写入的内容
-static LAST_CB_HASH:   Lazy<Mutex<u64>> = Lazy::new(|| Mutex::new(0));
-
-static SLAVES:  Lazy<Mutex<Vec<i64>>>         = Lazy::new(|| Mutex::new(vec![]));
-static KB_HOOK: Lazy<Mutex<Option<SafeHook>>> = Lazy::new(|| Mutex::new(None));
-static MS_HOOK: Lazy<Mutex<Option<SafeHook>>> = Lazy::new(|| Mutex::new(None));
-static BUS:          Lazy<Mutex<Option<Arc<EventBus>>>>  = Lazy::new(|| Mutex::new(None));
-static INPUT_WORKER: Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
-static TEXT_WORKER:  Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
-static FOCUS_WATCH:  Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
+pub(crate) static SLAVES: Lazy<Mutex<Vec<i64>>> = Lazy::new(|| Mutex::new(vec![]));
+pub(crate) static BUS: Lazy<Mutex<Option<Arc<EventBus>>>> = Lazy::new(|| Mutex::new(None));
 
 /// 还按着的键 / 鼠标键。补投抬起消息全靠它，见 `event_bus::PressedState` 的注释。
-static PRESSED: Lazy<Mutex<PressedState>> = Lazy::new(|| Mutex::new(PressedState::default()));
+pub(crate) static PRESSED: Lazy<Mutex<PressedState>> =
+    Lazy::new(|| Mutex::new(PressedState::default()));
 
 /// 上一次推送出去的状态 JSON，用来合并重复通知。
-static LAST_STATUS: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+pub(crate) static LAST_STATUS: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 
 /// 最后一次鼠标位置：补投鼠标抬起时要用同一套坐标。
-static LAST_POS: Lazy<Mutex<Pos>> = Lazy::new(|| Mutex::new(Pos::default()));
+pub(crate) static LAST_POS: Lazy<Mutex<Pos>> = Lazy::new(|| Mutex::new(Pos::default()));
+
+/// 当前这一套同步会话。`None` 表示没在同步。
+///
+/// 锁只用来换指针：拆除动作（要 join 线程、要等监听退出）一律在锁外做，
+/// 否则生命周期回调里的 `stop_sync()` 会和正在启动的 `start_sync()` 互相等死。
+pub(crate) static SESSION: Lazy<Mutex<Option<session::SyncSession>>> =
+    Lazy::new(|| Mutex::new(None));
 
 /// 取当前事件总线。同步没启动时是 `None`，钩子直接放弃即可。
 #[inline]
@@ -367,15 +374,7 @@ pub fn get_windows() -> Vec<WindowInfo> {
     }
 }
 
-fn remove_hooks() {
-    unsafe {
-        if let Some(h) = KB_HOOK.lock().take()  { let _ = UnhookWindowsHookEx(h.0); }
-        if let Some(h) = MS_HOOK.lock().take()  { let _ = UnhookWindowsHookEx(h.0); }
-    }
-}
-
 /// 状态版本号：任何字段变化都会 +1。
-///
 /// 宿主靠它判断「这条通知是不是比我已经渲染的新」，也让无载荷通知成为可能 ——
 /// 回调不用带任何数据，宿主拿这个数去比自己的最后一次即可。
 static STATUS_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -550,8 +549,12 @@ fn post_release(keys: &[(u32, u32)], buttons: u32) {
     }
 }
 
-fn start_input_worker(bus: Arc<EventBus>) {
-    let handle = std::thread::spawn(move || {
+/// 输入投递线程：把总线上的任务投给每个从窗口。
+///
+/// 线程句柄交给调用方（`session::EventWorker`）持有 —— 谁起谁 join，
+/// 不再挂在全局静态里等别的模块来收。
+pub(crate) fn spawn_input_worker(bus: Arc<EventBus>) -> JoinHandle<()> {
+    std::thread::spawn(move || {
         while let Some(batch) = bus.next_input(64) {
             let active = SYNC_ACTIVE.load(Ordering::Relaxed);
             for task in batch {
@@ -571,19 +574,17 @@ fn start_input_worker(bus: Arc<EventBus>) {
                 }
             }
         }
-    });
-    *INPUT_WORKER.lock() = Some(handle);
+    })
 }
 
 /// 文本同步独立线程：注入慢也只影响它自己。
-fn start_text_worker(bus: Arc<EventBus>) {
-    let handle = std::thread::spawn(move || {
+pub(crate) fn spawn_text_worker(bus: Arc<EventBus>) -> JoinHandle<()> {
+    std::thread::spawn(move || {
         while let Some(text) = bus.next_text() {
             if !SYNC_ACTIVE.load(Ordering::Relaxed) { continue; }
             inject_text(&text);
         }
-    });
-    *TEXT_WORKER.lock() = Some(handle);
+    })
 }
 
 /// 逐字注入文本。每个字之间检查一次停止标志，停止时最多再等一个字的时间。
@@ -662,12 +663,12 @@ fn flush_if_focus_lost() {
 /// 所以节奏从 30ms 放到 250ms；睡眠切成 10ms 一片，停止时 join 仍然最多等 10ms。
 /// 顺便每一秒做一次从窗口身份校验（`verify_targets`）—— 那是 `OpenProcess`，
 /// 不能放进投递热路径。
-fn start_focus_watch(bus: Arc<EventBus>) {
+pub(crate) fn spawn_focus_watch(bus: Arc<EventBus>) -> JoinHandle<()> {
     const SLICE_MS: u64 = 10;
     const SLICES_PER_CYCLE: u32 = 25;   // ≈250ms
     const VERIFY_EVERY_CYCLES: u32 = 4; // ≈1s
 
-    let handle = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut cycles: u32 = 0;
         while !bus.is_closed() {
             for _ in 0..SLICES_PER_CYCLE {
@@ -683,8 +684,7 @@ fn start_focus_watch(bus: Arc<EventBus>) {
                 verify_targets();
             }
         }
-    });
-    *FOCUS_WATCH.lock() = Some(handle);
+    })
 }
 
 // ── 窗口生命周期回调（由 `window_watch` 线程调用）────────────────────────
@@ -780,17 +780,6 @@ fn verify_targets() {
     emit_status();
 }
 
-/// 停掉工作线程并等它们把队列排空。`close()` 之后消费者会先取完剩余事件再退出。
-fn join_worker(slot: &Lazy<Mutex<Option<JoinHandle<()>>>>) {
-    if let Some(handle) = slot.lock().take() {
-        // 看门狗线程自己也会走到 stop_sync（主窗口失效那条路），
-        // 这时 join 自己会永远等下去 —— 直接放生，让它在当前这轮结束后自然退出。
-        if handle.thread().id() != std::thread::current().id() {
-            let _ = handle.join();
-        }
-    }
-}
-
 #[inline]
 fn make_lp(x: i32, y: i32) -> LPARAM {
     LPARAM((((y as u16 as u32) << 16) | (x as u16 as u32)) as isize)
@@ -868,107 +857,48 @@ fn map_client_point(x: i32, y: i32, src_w: i32, src_h: i32, target: HWND) -> (i3
     (nx.clamp(0, dst_w - 1), ny.clamp(0, dst_h - 1))
 }
 
-// ── start_sync ────────────────────────────────────────────────────────────
+// ── start_sync / stop_sync ────────────────────────────────────────────────
+//
+// 两条都是薄壳：真正的资源管理在 `session::SyncSession` 里。
+// 这里只负责「换指针」和「推送状态」，所以启动失败或停止重入都不会留下半套资源。
+
 pub fn start_sync(config: SyncConfig) -> Result<String, String> {
-    if SYNC_ACTIVE.load(Ordering::Relaxed) {
-        // 重启：走一遍正常停止流程，把残留按键放掉、线程收干净
-        let _ = stop_sync();
-    }
-    if config.master_hwnd == 0       { return Err("请先选择主窗口".into()); }
-    if config.slave_hwnds.is_empty() { return Err("请至少选择一个从窗口".into()); }
-
-    MASTER_HWND.store(config.master_hwnd, Ordering::Relaxed);
-    *SLAVES.lock() = config.slave_hwnds.clone();
-
-    // 记下主窗口与各从窗口的稳定身份（PID + 启动时间 + exe + 类名）。
-    // 之后靠它回答「这个句柄现在指的，还是当初那个窗口吗」—— 句柄和 PID 都会被系统复用。
-    window_id::MASTER_KEY.clear();
-    window_id::SLAVE_KEYS.clear();
-    if let Some(key) = window_id::WindowKey::of(HWND(config.master_hwnd as *mut _)) {
-        window_id::MASTER_KEY.insert(config.master_hwnd, key);
-    }
-    for hwnd in &config.slave_hwnds {
-        if let Some(key) = window_id::WindowKey::of(HWND(*hwnd as *mut _)) {
-            window_id::SLAVE_KEYS.insert(*hwnd, key);
-        }
-    }
-    SYNC_MOUSE.store(config.sync_mouse, Ordering::Relaxed);
-    SYNC_KEYBOARD.store(config.sync_keyboard, Ordering::Relaxed);
-    SYNC_CLIPBOARD.store(config.sync_clipboard, Ordering::Relaxed);
-    // 重置剪贴板哈希，避免误触发旧内容
-    *LAST_CB_HASH.lock() = 0;
-
-    // 每次启动都是一套新的总线与工作线程，旧的在 stop 里已经收干净
-    let bus = Arc::new(EventBus::new());
-    *BUS.lock() = Some(bus.clone());
-    *PRESSED.lock() = PressedState::default();
-    *LAST_STATUS.lock() = String::new();
-    *LAST_POS.lock() = Pos::default();
-
-    start_input_worker(bus.clone());
-    start_text_worker(bus.clone());
-    start_focus_watch(bus.clone());
-    start_clipboard_monitor();
-
-    unsafe {
-        // 全局低级 hook：鼠标 + 键盘
-        if config.sync_keyboard {
-            let h = SetWindowsHookExA(WH_KEYBOARD_LL, Some(kb_hook), None, 0)
-                .map_err(|e| e.to_string())?;
-            *KB_HOOK.lock() = Some(SafeHook(h));
-        }
-        if config.sync_mouse {
-            let h = SetWindowsHookExA(WH_MOUSE_LL, Some(ms_hook), None, 0)
-                .map_err(|e| e.to_string())?;
-            *MS_HOOK.lock() = Some(SafeHook(h));
-        }
+    // 先关旧会话，再建新的。拆除放在锁外做：那个过程要 join 线程、等监听退出，
+    // 占着锁会让生命周期回调里的 `stop_sync()` 一直排到超时。
+    let previous = { SESSION.lock().take() };
+    if let Some(previous) = previous {
+        let _ = previous.close();
     }
 
-    SYNC_ACTIVE.store(true, Ordering::Relaxed);
-    text_sync::set_enabled(config.text_mirror);
-    // 窗口生命周期监听：关窗口/切前台立刻知道，不用等下一次轮询或用户手动刷新
-    window_watch::start();
+    let session = session::SyncSession::open(&config)?;
+
+    // 走到这里说明 ①~⑤ 全部成功。中途失败的话 `session` 已经在 `open()` 里被 drop，
+    // 全局状态（主窗口 / 从窗口列表 / 身份键 / 按键表）也一并还原了。
+    SESSION.lock().replace(session);
+
     log("同步已启动");
     emit_status();
     Ok("同步已启动".into())
 }
 
 pub fn stop_sync() -> Result<String, String> {
-    // 顺序很关键：先摘钩子（不再有新事件进来），再补抬起，最后关总线等线程退出。
-    // 反过来的话，补抬起之后仍可能有排队的 KeyDown 落地，从窗口照样卡键。
-    remove_hooks();
-    // 先把自己标成「已停」再去关监听线程。监听线程退出前还会 drain 一次，
-    // 那一下如果还看到 SYNC_ACTIVE = true，就会从监听线程再叫一次 stop_sync，
-    // 变成「停止流程里重入停止流程」。标记放在前面，那次 drain 直接空转。
-    SYNC_ACTIVE.store(false, Ordering::Relaxed);
-    // 再停监听：拆除过程中不希望再有事件进来改列表
-    window_watch::shutdown();
-    text_sync::set_enabled(false);
-    // join 在 shutdown 里：文本线程退出前会把手上那一拍做完，不会留半截状态
-    text_sync::shutdown();
+    let session = { SESSION.lock().take() };
 
-    let (keys, buttons) = PRESSED.lock().drain();
-    let has_pressed = !keys.is_empty() || buttons != 0;
+    let Some(session) = session else {
+        // 没在同步。幂等返回 —— 生命周期回调可能连着叫两次，别把重复停止做成错误。
+        // 但「活动」标志还是要落一次：正常路径下它是会话拆解的第一步，这里没有会话可拆，
+        // 标志却仍可能是从别处写进来的（诊断、测试脚手架），不抹掉就一直显示「同步中」。
+        SYNC_ACTIVE.store(false, Ordering::Relaxed);
+        // 文本镜像可以被 FFI 单独打开（不经过会话），那条路径也要收一下
+        text_sync::shutdown();
+        return Ok("同步已停止".into());
+    };
 
-    if let Some(bus) = BUS.lock().take() {
-        if has_pressed {
-            // 走可靠队列：它会排在所有已入队的 KeyDown 之后投出去
-            bus.push_reliable(Reliable::Release { keys, buttons });
-        }
-        bus.close();
-    }
+    // ①~⑥ 的顺序全在 `close()` 里，包括「补抬起」要排在卸钩子之前。
+    // join 也在里面：返回时从窗口的按键状态一定已经复原了。
+    let released = session.close();
 
-    // join 是为了让「补抬起」真的投完再返回：调用方拿到「已停止」时，
-    // 从窗口的按键状态一定已经复原了。
-    join_worker(&INPUT_WORKER);
-    join_worker(&TEXT_WORKER);
-    join_worker(&FOCUS_WATCH);
-
-    PRESSED.lock().drain();
-    window_id::MASTER_KEY.clear();
-    window_id::SLAVE_KEYS.clear();
-
-    if has_pressed {
+    if released {
         log("同步已停止：已补投抬起所有按住的按键");
     } else {
         log("同步已停止");
@@ -1024,7 +954,7 @@ pub fn focus_window(hwnd: i64) -> Result<(), String> {
 
 // ── Hook 回调 ─────────────────────────────────────────────────────────────
 
-unsafe extern "system" fn ms_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+pub(crate) unsafe extern "system" fn ms_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 && SYNC_ACTIVE.load(Ordering::Relaxed) && SYNC_MOUSE.load(Ordering::Relaxed) {
         let ms     = &*(lp.0 as *const MSLLHOOKSTRUCT);
         let master = HWND(MASTER_HWND.load(Ordering::Relaxed) as *mut _);
@@ -1072,7 +1002,7 @@ unsafe extern "system" fn ms_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT 
 // 跟踪 Ctrl 键状态（用于检测 Ctrl+C 手动触发剪贴板同步）
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 
-unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+pub(crate) unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 && SYNC_ACTIVE.load(Ordering::Relaxed) {
         let kb     = &*(lp.0 as *const KBDLLHOOKSTRUCT);
         let master = HWND(MASTER_HWND.load(Ordering::Relaxed) as *mut _);
@@ -1151,11 +1081,10 @@ unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT 
     CallNextHookEx(None, code, wp, lp)
 }
 
-// 剪贴板监控：不再使用轮询，完全依靠 kb_hook 中的 Ctrl+C 检测触发
-// 轮询会导致从窗口收到多次相同文本（序列号变化 + Ctrl+C 各触发一次）
-fn start_clipboard_monitor() {
-    // 空函数，保留调用点不变
-}
+// 剪贴板监控：没有独立线程，也不再轮询。
+// Ctrl+C 由 `kb_hook` 直接识别（轮询会导致同一段文本被投两次：序列号变化一次、Ctrl+C 再触发一次），
+// 认出来之后 read_clipboard_text → push_text 进总线，由文本线程逐字注入。
+// 会话级的收尾（清掉上一轮的剪贴板哈希）在 `session::ClipboardHandler` 里。
 
 
 // ── 快捷启动 / 进程管理 ───────────────────────────────────────────────────
