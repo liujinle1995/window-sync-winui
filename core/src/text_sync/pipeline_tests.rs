@@ -10,8 +10,7 @@
 #![cfg(test)]
 
 use super::{apply, control, ReadResult};
-use once_cell::sync::Lazy;
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::MutexGuard;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -29,11 +28,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // ── 测试脚手架 ───────────────────────────────────────────────────────────
 
 /// 这些用例改的是模块级基线状态（`MASTER` / `SLAVES`），cargo 默认并行跑测试，
-/// 不串行化就会互相清基线。和 `lib.rs` 里那批真实窗口测试是同一类问题。
-static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-
+/// 不串行化就会互相清基线。用的是 `test_support` 里那把**进程级**锁 ——
+/// 窗口监听用例销毁窗口会触发 `stop_sync()`，一样会把这边的管线拆掉，
+/// 各模块各写一把锁是锁不住彼此的。
 fn serial() -> MutexGuard<'static, ()> {
-    TEST_LOCK.lock()
+    crate::test_support::serial()
 }
 
 struct Win(HWND);
@@ -210,6 +209,47 @@ fn set_master_and_observe(
     super::observe(id, master, text, caret, slaves)
 }
 
+/// 按调度器的节拍反复驱动，直到从窗口追平。
+///
+/// 为什么不能只打一拍再看结果：`observe` 在 settle 期间如果发现基线 `revision` 变了
+/// （并发的另一拍、或启停把状态清了），会**主动放弃这一拍**、并且不提交基线。
+/// 生产里 30ms 后的下一拍会原样重来，测试里只有手动补拍才等价。
+/// 机器负载高时单拍被丢掉是正常的，不是同步失败。
+///
+/// `slaves` 是投递目标（宿主的顶层窗口），`watch` 是真正有文本的输入子控件 ——
+/// 两者不是同一个句柄：读宿主窗口只会得到「不是文本控件」。
+fn drive_until(
+    master: HWND,
+    slaves: &[HWND],
+    watch: HWND,
+    content: &str,
+    caret: usize,
+    expected: &str,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(3000);
+    let want = Some(expected.to_string());
+    loop {
+        assert!(
+            apply::replace_all(master, &units(content), caret),
+            "写主窗口输入框失败"
+        );
+        let (text, caret_now) = read_master(master);
+        if let Some(id) = control::identify(master) {
+            super::observe(id, master, text, caret_now, slaves);
+        }
+        let caught_up = wait_for(
+            || control::read(watch).text().map(|t| String::from_utf16_lossy(&t)) == want,
+            120,
+        );
+        if caught_up {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
 // ── 用例 ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -228,9 +268,8 @@ fn pipeline_carries_tail_insert_to_the_slave() {
         assert_eq!(slave.text().as_deref(), Some(""));
 
         // 末尾追加 —— 走增量通道（WM_CHAR）
-        assert!(set_master_and_observe(master.0, "abc", 3, &slaves), "应该观察到改动");
         assert!(
-            wait_for(|| slave.text().as_deref() == Some("abc"), 800),
+            drive_until(master.0, &slaves, slave.edit, "abc", 3, "abc"),
             "从窗口没跟上：{:?}",
             slave.text()
         );
@@ -252,9 +291,8 @@ fn pipeline_handles_middle_insert() {
         assert!(!set_master_and_observe(master.0, "ac", 2, &slaves));
 
         // "ac" → "abc"：在中间插一个 b，只能整段重写
-        assert!(set_master_and_observe(master.0, "abc", 2, &slaves));
         assert!(
-            wait_for(|| slave.text().as_deref() == Some("abc"), 800),
+            drive_until(master.0, &slaves, slave.edit, "abc", 2, "abc"),
             "中间插字没同步过去：{:?}",
             slave.text()
         );
@@ -274,9 +312,8 @@ fn pipeline_handles_select_all_replace() {
         let slaves = [slave.host];
 
         assert!(!set_master_and_observe(master.0, "hello", 5, &slaves));
-        assert!(set_master_and_observe(master.0, "乐享", 2, &slaves));
         assert!(
-            wait_for(|| slave.text().as_deref() == Some("乐享"), 800),
+            drive_until(master.0, &slaves, slave.edit, "乐享", 2, "乐享"),
             "全选替换没同步过去：{:?}",
             slave.text()
         );
@@ -296,9 +333,8 @@ fn pipeline_handles_tail_delete() {
         let slaves = [slave.host];
 
         assert!(!set_master_and_observe(master.0, "abcde", 5, &slaves));
-        assert!(set_master_and_observe(master.0, "abc", 3, &slaves));
         assert!(
-            wait_for(|| slave.text().as_deref() == Some("abc"), 800),
+            drive_until(master.0, &slaves, slave.edit, "abc", 3, "abc"),
             "末尾删除没同步过去：{:?}",
             slave.text()
         );
@@ -390,9 +426,8 @@ fn pipeline_catches_up_a_slave_that_fell_behind() {
 
         // 第一次观察按设计只建基线
         assert!(!set_master_and_observe(master.0, "", 0, &slaves));
-        assert!(set_master_and_observe(master.0, "abcd", 4, &slaves));
         assert!(
-            wait_for(|| slave.text().as_deref() == Some("abcd"), 800),
+            drive_until(master.0, &slaves, slave.edit, "abcd", 4, "abcd"),
             "首轮没同步过去：{:?}",
             slave.text()
         );
@@ -401,9 +436,8 @@ fn pipeline_catches_up_a_slave_that_fell_behind() {
         assert!(apply::replace_all(slave.edit, &units("ab"), 2));
 
         // 主窗口再改一次（末尾追加），从窗口必须直接追到最新的完整文本
-        assert!(set_master_and_observe(master.0, "abcdef", 6, &slaves));
         assert!(
-            wait_for(|| slave.text().as_deref() == Some("abcdef"), 800),
+            drive_until(master.0, &slaves, slave.edit, "abcdef", 6, "abcdef"),
             "落后的从窗口没追上：{:?}",
             slave.text()
         );

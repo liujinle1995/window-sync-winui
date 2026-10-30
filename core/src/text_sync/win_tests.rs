@@ -140,6 +140,8 @@ fn units(s: &str) -> Vec<u16> {
 /// 这条是「读不到 ≠ 没输入」的正面证据：真正的空文本不会被误判成读不到。
 #[test]
 fn empty_edit_reads_as_empty_text_not_unreadable() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     unsafe {
         let host = host();
         let edit = edit(host.0);
@@ -159,6 +161,8 @@ fn empty_edit_reads_as_empty_text_not_unreadable() {
 /// 焦点控件身份要能认出这是 Edit 类，并且带上进程号
 #[test]
 fn focus_identity_reports_class_and_capability() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     unsafe {
         let host = host();
         let edit = edit(host.0);
@@ -175,6 +179,8 @@ fn focus_identity_reports_class_and_capability() {
 /// 按钮不是文本控件 —— 这里走 `NotText`，而不是「读到空文本」
 #[test]
 fn button_is_not_a_text_control() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     unsafe {
         let host = host();
         let button = button(host.0);
@@ -187,6 +193,8 @@ fn button_is_not_a_text_control() {
 /// 整段重写 + 光标复位：这是中间插字、全选替换的落地方式
 #[test]
 fn replace_all_writes_text_and_moves_caret() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     unsafe {
         let host = host();
         let edit = edit(host.0);
@@ -208,6 +216,8 @@ fn replace_all_writes_text_and_moves_caret() {
 /// 覆盖已有内容：从长文本换成长度更短的文本
 #[test]
 fn replace_all_shrinks_existing_text() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     unsafe {
         let host = host();
         let edit = edit(host.0);
@@ -229,6 +239,8 @@ fn replace_all_shrinks_existing_text() {
 /// `EM_SETSEL` 单独也要能用：增量补字之前要把光标摆到正确位置
 #[test]
 fn set_caret_is_honoured() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     unsafe {
         let host = host();
         let edit = edit(host.0);
@@ -245,6 +257,8 @@ fn set_caret_is_honoured() {
 /// 增量通道：投出去的 `WM_CHAR` 必须真的落进输入框（post 之后要 pump）
 #[test]
 fn posted_chars_land_in_the_edit() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     unsafe {
         let host = host();
         let edit = edit(host.0);
@@ -267,6 +281,8 @@ fn posted_chars_land_in_the_edit() {
 /// 退格通道：末尾删除走 `WM_CHAR('\b')`
 #[test]
 fn posted_backspaces_delete_from_the_end() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     unsafe {
         let host = host();
         let edit = edit(host.0);
@@ -289,6 +305,8 @@ fn posted_backspaces_delete_from_the_end() {
 /// 换控件后身份必须不同 —— 调度器靠这个判断「不要拿旧文本当差量」
 #[test]
 fn switching_focus_changes_identity() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     unsafe {
         let host = host();
         let first = edit(host.0);
@@ -314,6 +332,8 @@ fn switching_focus_changes_identity() {
 /// 这里验证两个控件的文本确实是独立的两份，调度器的身份判断才有依据。
 #[test]
 fn prefix_relationship_between_controls_keeps_them_separate() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     unsafe {
         let host = host();
         let first = edit(host.0);
@@ -333,6 +353,8 @@ fn prefix_relationship_between_controls_keeps_them_separate() {
 /// 同一进程里创建的真实窗口不会是无响应状态：读取必须立刻返回文本而不是超时
 #[test]
 fn read_never_reports_unresponsive_for_a_live_control() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     unsafe {
         let host = host();
         let edit = edit(host.0);
@@ -352,6 +374,8 @@ fn read_never_reports_unresponsive_for_a_live_control() {
 /// 前台窗口拿不到不代表功能坏了 —— 但至少要能安全调用，不 panic
 #[test]
 fn foreground_window_probe_is_safe() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     let _ = unsafe { GetForegroundWindow() };
 }
 
@@ -361,6 +385,8 @@ fn foreground_window_probe_is_safe() {
 /// 写在这里是为了让后面的人不必再猜：真要跳过密码框，得靠样式位判断，不是靠读取失败。
 #[test]
 fn password_style_edit_exposes_plaintext() {
+    // 这些用例会建窗口 / 抢焦点 / 动全局身份表，和别的模块并发会互相拆台
+    let _guard = crate::test_support::serial();
     const ES_PASSWORD: windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE =
         windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0x0020);
 

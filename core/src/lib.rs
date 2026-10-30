@@ -13,6 +13,8 @@
 pub mod event_bus;
 pub mod ffi;
 pub mod text_sync;
+pub mod window_id;
+pub mod window_watch;
 
 use event_bus::{EventBus, Pos, PressedState, Reliable, Task, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 
@@ -25,7 +27,7 @@ use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use windows::Win32::Foundation::{BOOL, HWND, HGLOBAL, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, HGLOBAL, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -41,8 +43,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_UNICODE, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EnumWindows, GetClientRect, GetForegroundWindow, GetWindowLongA, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageA, SetForegroundWindow,
+    CallNextHookEx, EnumWindows, GetForegroundWindow, GetWindowLongA, IsWindow, IsWindowVisible,
+    PostMessageA, SetForegroundWindow,
     SetWindowsHookExA, ShowWindow, UnhookWindowsHookEx, GWL_STYLE, HHOOK, KBDLLHOOKSTRUCT,
     MSLLHOOKSTRUCT, SW_RESTORE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
@@ -181,10 +183,19 @@ unsafe fn send_unicode_char(ch: u32) {
 }
 
 // ── 数据结构 ──────────────────────────────────────────────────────────────
+/// 窗口身份快照。定义在 `window_id`，这里导出以保持调用点不变。
+pub use window_id::WindowIdentity as WindowInfo;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WindowInfo  { pub hwnd: i64, pub title: String, pub pid: u32, pub visible: bool }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcessInfo { pub pid: u32, pub name: String, pub windows: Vec<WindowInfo> }
+pub struct ProcessInfo {
+    pub pid: u32,
+    /// 进程名（Toolhelp 给的 szExeFile，只有文件名）
+    pub name: String,
+    /// 可执行文件完整路径。同名不同目录的多开要靠它区分
+    #[serde(default)]
+    pub exe_path: String,
+    pub windows: Vec<WindowInfo>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig  {
     pub master_hwnd: i64,
@@ -213,16 +224,14 @@ struct EnumBuf { wins: Vec<WindowInfo> }
 unsafe extern "system" fn enum_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
     let buf = &mut *(lp.0 as *mut EnumBuf);
     if !IsWindowVisible(hwnd).as_bool() { return BOOL(1); }
-    let mut tmp = [0u16; 512];
-    let n = GetWindowTextW(hwnd, &mut tmp);
-    if n == 0 { return BOOL(1); }
-    let title = String::from_utf16_lossy(&tmp[..n as usize]).trim().to_string();
-    if title.is_empty() { return BOOL(1); }
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(hwnd, Some(&mut pid));
-    if pid == 0 { return BOOL(1); }
     if GetWindowLongA(hwnd, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 { return BOOL(1); }
-    buf.wins.push(WindowInfo { hwnd: hwnd.0 as i64, title, pid, visible: true });
+
+    // 身份采集放在 window_id 里：句柄、PID、启动时间、exe 路径、类名、父窗口、
+    // 客户区、DPI 一次采齐。没有标题的窗口对用户没意义，照旧跳过。
+    let Some(identity) = window_id::WindowIdentity::of(hwnd) else { return BOOL(1); };
+    if identity.title.is_empty() { return BOOL(1); }
+
+    buf.wins.push(identity);
     BOOL(1)
 }
 
@@ -238,7 +247,7 @@ pub fn get_processes() -> Vec<ProcessInfo> {
                 let name = String::from_utf16_lossy(
                     &e.szExeFile.iter().take_while(|&&c|c!=0).cloned().collect::<Vec<_>>()
                 ).to_string();
-                map.insert(pid, ProcessInfo { pid, name, windows: vec![] });
+                map.insert(pid, ProcessInfo { pid, name, exe_path: String::new(), windows: vec![] });
                 if Process32NextW(snap, &mut e).is_err() { break; }
             }
         }
@@ -248,7 +257,11 @@ pub fn get_processes() -> Vec<ProcessInfo> {
         for w in buf.wins { if let Some(p) = map.get_mut(&w.pid) { p.windows.push(w); } }
     }
     let mut v: Vec<ProcessInfo> = map.into_values().filter(|p|!p.windows.is_empty()).collect();
-    v.sort_by(|a,b| a.name.cmp(&b.name));
+    // 只给「有窗口」的那几个进程补 exe 路径：这是 OpenProcess，给全部进程补没必要
+    for p in &mut v {
+        p.exe_path = window_id::process_exe_path(p.pid).unwrap_or_default();
+    }
+    v.sort_by(|a,b| a.name.cmp(&b.name).then_with(|| a.pid.cmp(&b.pid)));
     v
 }
 
@@ -508,25 +521,137 @@ fn flush_if_focus_lost() {
 }
 
 /// 失焦兜底不能只靠钩子：用户 Alt+Tab 走开之后可能一个输入事件都不再产生。
-/// 所以再加一个轻量看门狗；30ms 一片睡眠，停止时 join 最多等这么久。
+///
+/// 有了 `window_watch` 的前台事件之后，这条路径已经是**兜底**而不是主路径，
+/// 所以节奏从 30ms 放到 250ms；睡眠切成 10ms 一片，停止时 join 仍然最多等 10ms。
+/// 顺便每一秒做一次从窗口身份校验（`verify_targets`）—— 那是 `OpenProcess`，
+/// 不能放进投递热路径。
 fn start_focus_watch(bus: Arc<EventBus>) {
+    const SLICE_MS: u64 = 10;
+    const SLICES_PER_CYCLE: u32 = 25;   // ≈250ms
+    const VERIFY_EVERY_CYCLES: u32 = 4; // ≈1s
+
     let handle = std::thread::spawn(move || {
+        let mut cycles: u32 = 0;
         while !bus.is_closed() {
-            for _ in 0..5 {
+            for _ in 0..SLICES_PER_CYCLE {
                 if bus.is_closed() { return; }
-                std::thread::sleep(std::time::Duration::from_millis(30));
+                std::thread::sleep(std::time::Duration::from_millis(SLICE_MS));
             }
             if !SYNC_ACTIVE.load(Ordering::Relaxed) { continue; }
+
             flush_if_focus_lost();
+
+            cycles = cycles.wrapping_add(1);
+            if cycles % VERIFY_EVERY_CYCLES == 0 {
+                verify_targets();
+            }
         }
     });
     *FOCUS_WATCH.lock() = Some(handle);
 }
 
+// ── 窗口生命周期回调（由 `window_watch` 线程调用）────────────────────────
+//
+// 这两条回调都在监听线程上跑，必须足够轻：只碰内存里的列表和状态，不做 SendMessage。
+
+/// 窗口销毁 / 隐藏。
+///
+/// 销毁一律剔除 —— 那个句柄马上可能被别的窗口拿走。
+/// 隐藏只记日志、**不剔除**：从窗口最小化到托盘或切场景时也会发 HIDE，
+/// 但它仍然是个有效窗口，剔掉就等于擅自丢了用户选的窗口。
+pub(crate) fn on_window_gone(hwnd: i64, why: &str) {
+    if !SYNC_ACTIVE.load(Ordering::Relaxed) { return; }
+
+    let master = MASTER_HWND.load(Ordering::Relaxed);
+    if hwnd == master {
+        if why == "已销毁" {
+            log("主窗口已关闭，同步自动停止");
+            let _ = stop_sync();
+        } else {
+            log("主窗口已隐藏，同步继续（消息仍可投递，只是看不见）");
+        }
+        return;
+    }
+
+    if why != "已销毁" {
+        // 隐藏：只提示，不动列表
+        let is_slave = SLAVES.lock().iter().any(|&h| h == hwnd);
+        if is_slave {
+            log(&format!("从窗口 0x{hwnd:X} 已隐藏（最小化到托盘 / 切场景），仍保留在同步列表"));
+        }
+        return;
+    }
+
+    let removed = {
+        let mut list = SLAVES.lock();
+        let before = list.len();
+        list.retain(|&h| h != hwnd);
+        list.len() != before
+    };
+    if removed {
+        window_id::SLAVE_KEYS.remove(hwnd);
+        log(&format!("从窗口 0x{hwnd:X} 已关闭，立即从同步列表移除"));
+        emit_status();
+    }
+}
+
+/// 前台窗口换人了。立刻做两件事：唤醒文本同步采样、把还按着的键放掉。
+///
+/// 这条把「失焦补抬起」从最多 250ms 的轮询延迟压到事件级。
+pub(crate) fn on_foreground_changed(hwnd: i64) {
+    if !SYNC_ACTIVE.load(Ordering::Relaxed) { return; }
+    text_sync::note_input();
+    if hwnd != MASTER_HWND.load(Ordering::Relaxed) {
+        flush_if_focus_lost();
+    }
+}
+
+/// 校验主窗口 / 从窗口还是不是原来那个窗口。
+///
+/// 单靠 `IsWindow` 不够：句柄会被系统复用，`IsWindow` 对一个「恰好占用了同一个句柄值」
+/// 的新窗口照样返回真。这里比的是 PID + 进程启动时间 + EXE 路径 + 窗口类名。
+fn verify_targets() {
+    if !SYNC_ACTIVE.load(Ordering::Relaxed) { return; }
+
+    let master = MASTER_HWND.load(Ordering::Relaxed);
+    if master != 0 && !window_id::MASTER_KEY.still_original(master) {
+        log("主窗口已失效或句柄被系统复用，同步自动停止");
+        let _ = stop_sync();
+        return;
+    }
+
+    let gone: Vec<i64> = {
+        let list = SLAVES.lock();
+        list.iter()
+            .copied()
+            .filter(|h| !window_id::SLAVE_KEYS.still_original(*h))
+            .collect()
+    };
+    if gone.is_empty() { return; }
+
+    {
+        let mut list = SLAVES.lock();
+        list.retain(|h| !gone.contains(h));
+    }
+    for h in &gone {
+        window_id::SLAVE_KEYS.remove(*h);
+    }
+    log(&format!(
+        "{} 个从窗口已失效或句柄被系统复用，已从同步列表移除",
+        gone.len()
+    ));
+    emit_status();
+}
+
 /// 停掉工作线程并等它们把队列排空。`close()` 之后消费者会先取完剩余事件再退出。
 fn join_worker(slot: &Lazy<Mutex<Option<JoinHandle<()>>>>) {
     if let Some(handle) = slot.lock().take() {
-        let _ = handle.join();
+        // 看门狗线程自己也会走到 stop_sync（主窗口失效那条路），
+        // 这时 join 自己会永远等下去 —— 直接放生，让它在当前这轮结束后自然退出。
+        if handle.thread().id() != std::thread::current().id() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -583,14 +708,12 @@ fn mouse_message(
 }
 
 /// 客户区尺寸。取不到（窗口已销毁 / 最小化到 0）时返回 `None`，调用方按「不缩放」处理。
+///
+/// 与 `window_id::client_size` 的区别只在这里：那边如实返回 0×0（身份快照要如实记录），
+/// 这边把 0 尺寸当成「取不到」，因为映射时拿 0 做除数会算出垃圾。
 fn client_size(h: HWND) -> Option<(i32, i32)> {
-    let mut rect = RECT::default();
-    if unsafe { GetClientRect(h, &mut rect) }.is_ok() {
-        let w = rect.right - rect.left;
-        let h = rect.bottom - rect.top;
-        if w > 0 && h > 0 { return Some((w, h)); }
-    }
-    None
+    let (w, h) = window_id::client_size(h)?;
+    if w > 0 && h > 0 { Some((w, h)) } else { None }
 }
 
 /// 把主窗口客户区坐标按**客户区比例**映射到从窗口客户区坐标。
@@ -620,6 +743,19 @@ pub fn start_sync(config: SyncConfig) -> Result<String, String> {
 
     MASTER_HWND.store(config.master_hwnd, Ordering::Relaxed);
     *SLAVES.lock() = config.slave_hwnds.clone();
+
+    // 记下主窗口与各从窗口的稳定身份（PID + 启动时间 + exe + 类名）。
+    // 之后靠它回答「这个句柄现在指的，还是当初那个窗口吗」—— 句柄和 PID 都会被系统复用。
+    window_id::MASTER_KEY.clear();
+    window_id::SLAVE_KEYS.clear();
+    if let Some(key) = window_id::WindowKey::of(HWND(config.master_hwnd as *mut _)) {
+        window_id::MASTER_KEY.insert(config.master_hwnd, key);
+    }
+    for hwnd in &config.slave_hwnds {
+        if let Some(key) = window_id::WindowKey::of(HWND(*hwnd as *mut _)) {
+            window_id::SLAVE_KEYS.insert(*hwnd, key);
+        }
+    }
     SYNC_MOUSE.store(config.sync_mouse, Ordering::Relaxed);
     SYNC_KEYBOARD.store(config.sync_keyboard, Ordering::Relaxed);
     SYNC_CLIPBOARD.store(config.sync_clipboard, Ordering::Relaxed);
@@ -654,6 +790,8 @@ pub fn start_sync(config: SyncConfig) -> Result<String, String> {
 
     SYNC_ACTIVE.store(true, Ordering::Relaxed);
     text_sync::set_enabled(config.text_mirror);
+    // 窗口生命周期监听：关窗口/切前台立刻知道，不用等下一次轮询或用户手动刷新
+    window_watch::start();
     log("同步已启动");
     emit_status();
     Ok("同步已启动".into())
@@ -663,7 +801,12 @@ pub fn stop_sync() -> Result<String, String> {
     // 顺序很关键：先摘钩子（不再有新事件进来），再补抬起，最后关总线等线程退出。
     // 反过来的话，补抬起之后仍可能有排队的 KeyDown 落地，从窗口照样卡键。
     remove_hooks();
+    // 先把自己标成「已停」再去关监听线程。监听线程退出前还会 drain 一次，
+    // 那一下如果还看到 SYNC_ACTIVE = true，就会从监听线程再叫一次 stop_sync，
+    // 变成「停止流程里重入停止流程」。标记放在前面，那次 drain 直接空转。
     SYNC_ACTIVE.store(false, Ordering::Relaxed);
+    // 再停监听：拆除过程中不希望再有事件进来改列表
+    window_watch::shutdown();
     text_sync::set_enabled(false);
     // join 在 shutdown 里：文本线程退出前会把手上那一拍做完，不会留半截状态
     text_sync::shutdown();
@@ -686,6 +829,8 @@ pub fn stop_sync() -> Result<String, String> {
     join_worker(&FOCUS_WATCH);
 
     PRESSED.lock().drain();
+    window_id::MASTER_KEY.clear();
+    window_id::SLAVE_KEYS.clear();
 
     if has_pressed {
         log("同步已停止：已补投抬起所有按住的按键");
@@ -939,6 +1084,151 @@ pub fn kill_process_by_name(exe_name: String) -> Result<u32, String> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    //! 真实窗口的测试脚手架。
+    //!
+    //! `window_id` / `window_watch` 的用例需要「一个有类名、有标题、尺寸确定」的顶层窗口，
+    //! 放在这里给几个测试模块共用，免得每处各写一份 `RegisterClassW`。
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WNDCLASSW, WS_POPUP,
+    };
+
+    /// 进程级串行锁。
+    ///
+    /// 主窗口 / 从窗口列表、按键状态、文本管线、窗口监听线程都是**全局单例**，
+    /// 任何会动它们的用例都必须互斥。尤其是一条跨模块的坑：窗口监听用例销毁窗口
+    /// 会触发 `on_window_gone` → `stop_sync()`，那是把整条同步拆掉 ——
+    /// 并行的文本管线用例会莫名其妙地「中途停摆」。
+    /// 所以锁必须全局唯一，不能每个模块各来一把。
+    static GLOBAL_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    pub fn serial() -> parking_lot::MutexGuard<'static, ()> {
+        GLOBAL_LOCK.lock()
+    }
+
+    /// 测试窗口，Drop 时销毁。
+    ///
+    /// `WS_POPUP` 没有边框和标题栏，客户区尺寸精确等于创建尺寸，断言可以直接写死。
+    pub struct TestWindow(pub HWND);
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    unsafe extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        unsafe { DefWindowProcW(h, m, w, l) }
+    }
+
+    /// 固定规格：400×300、类名 `LxSyncIdentityTestHost`、有标题
+    pub fn popup_window() -> TestWindow {
+        unsafe { popup("LxSyncIdentityTestHost", "identity-test", 400, 300) }
+    }
+
+    pub unsafe fn popup(class: &str, title: &str, width: i32, height: i32) -> TestWindow {
+        let class_w: Vec<u16> = class.encode_utf16().chain(std::iter::once(0)).collect();
+        let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let instance: windows::Win32::Foundation::HINSTANCE =
+            unsafe { GetModuleHandleW(None) }.unwrap().into();
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: instance,
+            lpszClassName: PCWSTR(class_w.as_ptr()),
+            ..Default::default()
+        };
+        // 同一个类名注册第二次会失败，类已存在照样能用
+        let _ = unsafe { RegisterClassW(&wc) };
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                PCWSTR(class_w.as_ptr()),
+                PCWSTR(title_w.as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                width,
+                height,
+                None,
+                None,
+                instance,
+                None,
+            )
+        }
+        .unwrap();
+        TestWindow(hwnd)
+    }
+
+    // ── 伪造一套「同步正在运行」的全局状态 ──────────────────────────────
+    //
+    // 生命周期回调只看这几个全局量，不需要真的起队列、钩子和线程。
+    // 这样测试就能直接驱动 `on_window_gone` / `verify_targets` 这两个入口。
+
+    use std::sync::atomic::Ordering;
+
+    pub fn hwnd_value(h: HWND) -> i64 {
+        h.0 as isize as i64
+    }
+
+    pub fn begin_fake_sync(master: i64, slaves: &[i64]) {
+        crate::MASTER_HWND.store(master, Ordering::Relaxed);
+        *crate::SLAVES.lock() = slaves.to_vec();
+
+        crate::window_id::MASTER_KEY.clear();
+        crate::window_id::SLAVE_KEYS.clear();
+        if let Some(key) = crate::window_id::WindowKey::of(HWND(master as isize as *mut _)) {
+            crate::window_id::MASTER_KEY.insert(master, key);
+        }
+        for &slave in slaves {
+            if let Some(key) = crate::window_id::WindowKey::of(HWND(slave as isize as *mut _)) {
+                crate::window_id::SLAVE_KEYS.insert(slave, key);
+            }
+        }
+
+        crate::SYNC_ACTIVE.store(true, Ordering::Relaxed);
+    }
+
+    pub fn end_fake_sync() {
+        crate::SYNC_ACTIVE.store(false, Ordering::Relaxed);
+        crate::MASTER_HWND.store(0, Ordering::Relaxed);
+        crate::SLAVES.lock().clear();
+        crate::window_id::MASTER_KEY.clear();
+        crate::window_id::SLAVE_KEYS.clear();
+    }
+
+    pub fn slaves() -> Vec<i64> {
+        crate::SLAVES.lock().clone()
+    }
+
+    pub fn sync_active() -> bool {
+        crate::SYNC_ACTIVE.load(Ordering::Relaxed)
+    }
+
+    /// 直接跑一次身份校验（生产代码里由看门狗每秒调一次）
+    pub fn verify_now() {
+        crate::verify_targets();
+    }
+
+    /// 一个「绝对不属于当前窗口」的身份，用来模拟句柄被系统复用
+    pub fn foreign_key() -> crate::window_id::WindowKey {
+        crate::window_id::WindowKey {
+            pid: 0xDEAD,
+            process_start_time: 1,
+            exe_path: r"C:\Somewhere\other.exe".to_string(),
+            class_name: "OtherWindowClass".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use windows::core::w;
@@ -1121,7 +1411,10 @@ mod tests {
 
     /// 这些用例共用 `SLAVES` / `RECEIVED` 等全局状态，并行跑会互相串扰，必须串行。
     /// （单独跑某个用例时它是绿的，一起跑就红 —— 就是并行闹的。）
-    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    /// 用 `test_support` 里那把进程级锁：窗口监听用例触发的 `stop_sync()` 同样会拆这里的东西。
+    fn serial() -> parking_lot::MutexGuard<'static, ()> {
+        crate::test_support::serial()
+    }
 
     /// 用来接消息的窗口：所有收到的消息都记到这个静态表里
     static RECEIVED: Lazy<Mutex<Vec<(u32, usize, isize)>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -1201,7 +1494,7 @@ mod tests {
 
     #[test]
     fn key_down_and_up_reach_the_slave_window() {
-        let _guard = TEST_LOCK.lock();
+        let _guard = serial();
         let slave = unsafe { recording_window() };
         with_slave(slave.0, || {
             post_key(true, 0x41, 0x1E);
@@ -1215,7 +1508,7 @@ mod tests {
     /// 停止同步时补投的抬起，必须落到从窗口上 —— 这是「从窗口一直以为鼠标按着」的修复点
     #[test]
     fn release_message_reaches_slave_for_keys_and_buttons() {
-        let _guard = TEST_LOCK.lock();
+        let _guard = serial();
         let slave = unsafe { recording_window() };
         with_slave(slave.0, || {
             // 模拟「按着 A 和左键，然后停止同步」
@@ -1237,7 +1530,7 @@ mod tests {
     /// 失焦 / 停止时的兜底入口：`flush_pressed` 在没有总线的情况下直接投递
     #[test]
     fn flush_pressed_posts_release_without_bus() {
-        let _guard = TEST_LOCK.lock();
+        let _guard = serial();
         let slave = unsafe { recording_window() };
         with_slave(slave.0, || {
             PRESSED.lock().key_down(0x20, 0x39); // 空格
@@ -1253,7 +1546,7 @@ mod tests {
     /// 鼠标键状态：按下记位、抬起清位，且不会把别的键位带掉
     #[test]
     fn note_button_tracks_mask() {
-        let _guard = TEST_LOCK.lock();
+        let _guard = serial();
         PRESSED.lock().drain();
         note_button(WM_LBUTTONDOWN, true);
         note_button(WM_RBUTTONDOWN, true);
