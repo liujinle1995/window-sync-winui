@@ -39,8 +39,8 @@ use serde::Serialize;
 use crate::abi::{self, Code};
 use crate::{
     focus_window, get_processes, get_sync_status, get_windows, kill_process, kill_process_by_name,
-    launch_app, start_sync, stop_sync, text_sync, update_sync_options, LogCb, StatusCb,
-    StatusNotifyCb, SyncConfig,
+    launch_app, start_sync, stop_sync, swap_master, text_sync, update_sync_options, LogCb,
+    StatusCb, StatusNotifyCb, SyncConfig,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -479,6 +479,24 @@ pub unsafe extern "C" fn wsync_set_text_mirror(args_json: *const c_char) -> *mut
                 ok(&true)
             }
             Err((code, msg)) => fail(code, msg),
+        }
+    })
+}
+
+/// 主从对调：把指定从窗口提升为主窗口，原主窗口降为从窗口。
+///
+/// 同步运行中也能切 —— 引擎会在切换前放掉按住的键、重建窗口身份、作废文本基线，
+/// 投递不中断。没在同步时调用会拿到 `NOT_RUNNING`（那时宿主只要改自己的选择即可，
+/// 下次 `start_sync` 会按新配置重建一切）。
+#[no_mangle]
+pub extern "C" fn wsync_swap_master(slave_hwnd: i64) -> *mut c_char {
+    guard(|| {
+        if slave_hwnd == 0 {
+            return fail(Code::InvalidArg, "slave_hwnd 不能为 0");
+        }
+        match swap_master(slave_hwnd) {
+            Ok(()) => ok(&true),
+            Err(e) => err(e),
         }
     })
 }

@@ -100,6 +100,14 @@ public sealed partial class SetupPage : Page
         if (_contextWindow is not null) ViewModel.SetMasterCommand.Execute(_contextWindow);
     }
 
+    /// <summary>主从对调：行内按钮与右键菜单共用这一个入口。</summary>
+    private void OnRowSwapMasterClick(object sender, RoutedEventArgs e)
+    {
+        // 行内按钮直接带 DataContext；右键菜单拿不到，退回 _contextWindow
+        var item = (sender as FrameworkElement)?.DataContext as WindowItem ?? _contextWindow;
+        if (item is not null) ViewModel.SwapMasterCommand.Execute(item);
+    }
+
     private void OnRowToggleSyncClick(object sender, RoutedEventArgs e)
     {
         if (_contextWindow is not null) ViewModel.ToggleSlaveCommand.Execute(_contextWindow);

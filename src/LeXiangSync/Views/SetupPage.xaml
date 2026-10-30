@@ -399,6 +399,7 @@
                                         <ColumnDefinition Width="26" />
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="96" />
+                                        <ColumnDefinition Width="24" />
                                     </Grid.ColumnDefinitions>
 
                                     <CheckBox
@@ -436,16 +437,18 @@
                                                 ColumnSpacing="8"
                                                 DoubleTapped="OnRowDoubleTapped"
                                                 RightTapped="OnRowRightTapped"
-                                                ToolTipService.ToolTip="双击一键聚焦 · 右键结束进程 / 设为主窗口">
+                                                ToolTipService.ToolTip="双击一键聚焦 · 右键结束进程 / 设为主窗口 / 主从对调">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="26" />
                                                     <ColumnDefinition Width="*" />
                                                     <ColumnDefinition Width="96" />
+                                                    <ColumnDefinition Width="24" />
                                                 </Grid.ColumnDefinitions>
 
                                                 <Grid.ContextFlyout>
                                                     <MenuFlyout>
                                                         <MenuFlyoutItem Click="OnRowSetMasterClick" Text="设为主窗口" />
+                                                        <MenuFlyoutItem Click="OnRowSwapMasterClick" Text="与主窗口对调" />
                                                         <MenuFlyoutItem Click="OnRowToggleSyncClick" Text="加入 / 移出同步" />
                                                         <MenuFlyoutSeparator />
                                                         <MenuFlyoutItem Click="OnRowFocusClick" Text="聚焦窗口" />
@@ -455,7 +458,7 @@
 
                                                 <!-- 主窗口行垫暖色底：设计稿用这一层把「源」标出来 -->
                                                 <Border
-                                                    Grid.ColumnSpan="3"
+                                                    Grid.ColumnSpan="4"
                                                     Background="{ThemeResource LxMasterSoftBrush}"
                                                     CornerRadius="4"
                                                     Visibility="{x:Bind IsMaster, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
@@ -503,6 +506,26 @@
                                                         Text="未加入"
                                                         Visibility="{x:Bind IsNone, Mode=OneWay, Converter={StaticResource BoolToVisibility}}" />
                                                 </Grid>
+
+                                                <!--
+                                                    主从对调：只在从窗口行出现。放在角色列右侧而不是右键菜单里，
+                                                    是因为「换号操作」是多开时的高频动作，两步点击太慢。
+                                                -->
+                                                <Button
+                                                    Grid.Column="3"
+                                                    Width="22"
+                                                    Height="22"
+                                                    Padding="0"
+                                                    AutomationProperties.Name="与主窗口对调"
+                                                    Click="OnRowSwapMasterClick"
+                                                    Style="{StaticResource LxIconButtonStyle}"
+                                                    ToolTipService.ToolTip="与主窗口对调：它变主窗口，原主窗口转从窗口（同步运行中也能切）"
+                                                    Visibility="{x:Bind IsSlave, Mode=OneWay, Converter={StaticResource BoolToVisibility}}">
+                                                    <FontIcon
+                                                        FontSize="12"
+                                                        Foreground="{ThemeResource LxSlaveBrush}"
+                                                        Glyph="&#xE8AB;" />
+                                                </Button>
                                             </Grid>
                                         </Border>
                                     </DataTemplate>

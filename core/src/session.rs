@@ -312,16 +312,7 @@ impl SyncSession {
 
         // 记下主窗口与各从窗口的稳定身份（PID + 启动时间 + exe + 类名）。
         // 之后靠它回答「这个句柄现在指的，还是当初那个窗口吗」—— 句柄和 PID 都会被系统复用。
-        window_id::MASTER_KEY.clear();
-        window_id::SLAVE_KEYS.clear();
-        if let Some(key) = window_id::WindowKey::of(HWND(config.master_hwnd as *mut _)) {
-            window_id::MASTER_KEY.insert(config.master_hwnd, key);
-        }
-        for hwnd in &config.slave_hwnds {
-            if let Some(key) = window_id::WindowKey::of(HWND(*hwnd as *mut _)) {
-                window_id::SLAVE_KEYS.insert(*hwnd, key);
-            }
-        }
+        crate::capture_identities(config.master_hwnd, &config.slave_hwnds);
 
         crate::SYNC_MOUSE.store(config.sync_mouse, Ordering::Relaxed);
         crate::SYNC_KEYBOARD.store(config.sync_keyboard, Ordering::Relaxed);

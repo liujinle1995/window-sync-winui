@@ -205,6 +205,16 @@ pub(crate) static LAST_POS: Lazy<Mutex<Pos>> = Lazy::new(|| Mutex::new(Pos::defa
 pub(crate) static SESSION: Lazy<Mutex<Option<session::SyncSession>>> =
     Lazy::new(|| Mutex::new(None));
 
+/// 串行化「角色变更（主从对调）」与「身份复查」。
+///
+/// 两者都要读「当前主窗口是谁 + 它的身份键是什么」，而角色变更必然先改键再改句柄
+/// （或者反过来），中间一定有一瞬间两边对不上。不加这把锁的话，看门狗正好落在那一瞬间，
+/// 就会把刚升上来的主窗口判成「句柄被系统复用」，把整条同步停掉。
+///
+/// 锁内只做读写判断，**不要在持锁时调用 `stop_sync()`** —— 那要 join 线程，
+/// 而线程可能正等着这把锁。
+pub(crate) static ROLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
 /// 取当前事件总线。同步没启动时是 `None`，钩子直接放弃即可。
 #[inline]
 fn bus() -> Option<Arc<EventBus>> {
@@ -747,31 +757,42 @@ pub(crate) fn on_foreground_changed(hwnd: i64) {
 ///
 /// 单靠 `IsWindow` 不够：句柄会被系统复用，`IsWindow` 对一个「恰好占用了同一个句柄值」
 /// 的新窗口照样返回真。这里比的是 PID + 进程启动时间 + EXE 路径 + 窗口类名。
+///
+/// 判断在 [`ROLE_LOCK`] 里做、处置在锁外做：处置会走 `stop_sync()`，那要 join 线程，
+/// 持着锁等线程退出会把「线程也在等这把锁」变成死锁。
 fn verify_targets() {
     if !SYNC_ACTIVE.load(Ordering::Relaxed) { return; }
 
-    let master = MASTER_HWND.load(Ordering::Relaxed);
-    if master != 0 && !window_id::MASTER_KEY.still_original(master) {
+    let (master_gone, gone): (bool, Vec<i64>) = {
+        let _role = ROLE_LOCK.lock();
+
+        let master = MASTER_HWND.load(Ordering::Relaxed);
+        let master_gone = master != 0 && !window_id::MASTER_KEY.still_original(master);
+
+        let list = SLAVES.lock();
+        let gone = list
+            .iter()
+            .copied()
+            .filter(|h| !window_id::SLAVE_KEYS.still_original(*h))
+            .collect();
+        (master_gone, gone)
+    };
+
+    if master_gone {
         log("主窗口已失效或句柄被系统复用，同步自动停止");
         let _ = stop_sync();
         return;
     }
 
-    let gone: Vec<i64> = {
-        let list = SLAVES.lock();
-        list.iter()
-            .copied()
-            .filter(|h| !window_id::SLAVE_KEYS.still_original(*h))
-            .collect()
-    };
     if gone.is_empty() { return; }
 
     {
+        let _role = ROLE_LOCK.lock();
         let mut list = SLAVES.lock();
         list.retain(|h| !gone.contains(h));
-    }
-    for h in &gone {
-        window_id::SLAVE_KEYS.remove(*h);
+        for h in &gone {
+            window_id::SLAVE_KEYS.remove(*h);
+        }
     }
     log(&format!(
         "{} 个从窗口已失效或句柄被系统复用，已从同步列表移除",
@@ -905,6 +926,89 @@ pub fn stop_sync() -> Result<String, String> {
     }
     emit_status();
     Ok("同步已停止".into())
+}
+
+/// 按给定的主窗口 / 从窗口列表重采一遍稳定身份。
+///
+/// 身份键回答的是「这个句柄现在指的，还是当初那个窗口吗」。主从角色一变就必须整体重建 ——
+/// 只改 `MASTER_HWND` 而漏掉这里，一秒后的身份复查会把刚升上来的新主窗口判成
+/// 「句柄被复用」，直接把同步停掉。
+pub(crate) fn capture_identities(master: i64, slaves: &[i64]) {
+    window_id::MASTER_KEY.clear();
+    window_id::SLAVE_KEYS.clear();
+    if let Some(key) = window_id::WindowKey::of(HWND(master as *mut _)) {
+        window_id::MASTER_KEY.insert(master, key);
+    }
+    for &hwnd in slaves {
+        if let Some(key) = window_id::WindowKey::of(HWND(hwnd as *mut _)) {
+            window_id::SLAVE_KEYS.insert(hwnd, key);
+        }
+    }
+}
+
+/// 主从对调：把 `slave_hwnd` 提升为主窗口，原主窗口降为从窗口。
+///
+/// 这是「换一个号来操作」的一步操作 —— 不用停下再启动，投递全程不断。
+/// 要在运行中安全地换，三件事一件都不能少：
+///
+/// 1. **先把按住的键放掉，而且同步投出去**。投递读的是「当前从窗口列表」，
+///    排进队列的那条 Release 会在列表换完之后才被消费，那时它投给的已经是新列表 ——
+///    旧主窗口变成从窗口之后就会漏掉这次抬起，永久卡键。
+/// 2. **身份键整体重建**，否则一秒后看门狗会把新主窗口判成句柄复用。
+/// 3. **文本基线作废**。基线绑的是旧主窗口焦点控件的内容与光标，不丢的话下一次采样
+///    会把新窗口的整段文本当成「在旧内容上大改」，然后整段重写灌给从窗口。
+pub fn swap_master(slave_hwnd: i64) -> Result<(), String> {
+    if slave_hwnd == 0 {
+        return Err("参数错误：从窗口句柄不能为 0".into());
+    }
+
+    let _role = ROLE_LOCK.lock();
+
+    // 判「在不在同步」只能看这个标志。`MASTER_HWND` 在停止后是**故意保留**的
+    // （宿主靠它恢复上次的选择），拿它非零当「正在跑」会一路走到下面的列表检查，
+    // 最后报出一个「该窗口不是从窗口」的错误 —— 那是参数问题，不是状态问题。
+    if !SYNC_ACTIVE.load(Ordering::Relaxed) {
+        return Err("同步尚未启动，请先开始同步".into());
+    }
+
+    let old_master = MASTER_HWND.load(Ordering::Relaxed);
+    if old_master == 0 {
+        return Err("同步尚未启动，请先开始同步".into());
+    }
+    if slave_hwnd == old_master {
+        return Err("参数错误：该窗口已经是主窗口".into());
+    }
+    if !SLAVES.lock().contains(&slave_hwnd) {
+        return Err("参数错误：该窗口不是从窗口".into());
+    }
+
+    // ① 放掉还按着的键，直接投（不走队列，理由见上面的注释）
+    let (keys, buttons) = PRESSED.lock().drain();
+    if !keys.is_empty() || buttons != 0 {
+        post_release(&keys, buttons);
+    }
+
+    // ② 换角色：新主从列表里摘掉，旧主补到末尾（其余从窗口的序号不变）
+    let new_slaves = {
+        let mut list = SLAVES.lock();
+        list.retain(|&h| h != slave_hwnd);
+        if !list.contains(&old_master) {
+            list.push(old_master);
+        }
+        list.clone()
+    };
+    MASTER_HWND.store(slave_hwnd, Ordering::Relaxed);
+    capture_identities(slave_hwnd, &new_slaves);
+
+    // ③ 文本基线与上次鼠标位置作废：前者绑旧窗口的焦点控件，后者是旧窗口客户区坐标
+    text_sync::reset_baseline();
+    *LAST_POS.lock() = Pos::default();
+
+    log(&format!(
+        "主从已对调：0x{slave_hwnd:X} 成为主窗口，0x{old_master:X} 转为从窗口"
+    ));
+    emit_status();
+    Ok(())
 }
 
 pub fn get_sync_status() -> SyncStatus {

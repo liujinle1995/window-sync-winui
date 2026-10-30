@@ -323,6 +323,29 @@ public sealed partial class SetupViewModel
         RefreshSelectionFlags();
     }
 
+    /// <summary>
+    /// 主从对调：把这一行（从窗口）提到主窗口位置，原主窗口转为从窗口。
+    /// <para>
+    /// 和「设为主窗口」的区别是**不丢人** —— 后者会把原主窗口变成「未加入」，
+    /// 想换着号操作就得重新勾一遍。对调保持同步列表不变，多开时切号最省事。
+    /// 同步运行中也能点，投递不中断。
+    /// </para>
+    /// </summary>
+    [RelayCommand]
+    public void SwapMaster(WindowItem? item)
+    {
+        if (item is null || !item.IsSlave) return;
+
+        if (!_engine.SwapMaster(item.Window.Hwnd))
+        {
+            _log.Add("主从切换失败：该窗口可能已经不在同步列表里了", LogLevel.Warning);
+            RefreshSelectionFlags();
+            return;
+        }
+
+        RefreshSelectionFlags();
+    }
+
     /// <summary>行首勾选框：主窗口保持不变，仅切换「是否为从窗口」。</summary>
     [RelayCommand]
     public void ToggleSlave(WindowItem? item)

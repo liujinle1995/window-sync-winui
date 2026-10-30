@@ -136,6 +136,9 @@ internal static class SyncNative
     [DllImport(Dll, EntryPoint = "wsync_focus_window", CallingConvention = Cconv)]
     private static extern IntPtr FocusWindowCore(long hwnd);
 
+    [DllImport(Dll, EntryPoint = "wsync_swap_master", CallingConvention = Cconv)]
+    private static extern IntPtr SwapMasterCore(long slaveHwnd);
+
     // ── 进程 / 快捷启动 ───────────────────────────────────────────────────
     [DllImport(Dll, EntryPoint = "wsync_launch_app", CallingConvention = Cconv)]
     private static extern IntPtr LaunchAppCore(IntPtr argsJson);
@@ -312,6 +315,16 @@ internal static class SyncNative
         Call(Serialize(new MirrorArgs(enabled)), SetTextMirrorCore);
 
     public static void FocusWindow(long hwnd) => Call(() => FocusWindowCore(hwnd));
+
+    /// <summary>
+    /// 主从对调：把指定从窗口提升为主窗口，原主窗口降为从窗口。
+    /// <para>
+    /// 同步运行中也能切，投递不中断 —— 引擎会先放掉按住的键、重建窗口身份、
+    /// 作废文本基线，再从新主窗口开始采集。未运行时调用会抛
+    /// <see cref="NativeError.NotRunning"/>。
+    /// </para>
+    /// </summary>
+    public static void SwapMaster(long slaveHwnd) => Call(() => SwapMasterCore(slaveHwnd));
 
     public static uint LaunchApp(string path, IReadOnlyList<string> args) =>
         Call(Serialize(new LaunchArgs(path, args)), LaunchAppCore).GetUInt32();

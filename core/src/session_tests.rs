@@ -9,6 +9,7 @@
 use crate::session;
 use crate::test_support as ts;
 use crate::{start_sync, stop_sync, SyncConfig, BUS, PRESSED, SLAVES};
+use std::sync::atomic::Ordering;
 
 fn config(master: i64, slaves: &[i64]) -> SyncConfig {
     SyncConfig {
@@ -279,6 +280,167 @@ fn stopping_the_session_also_reclaims_the_mirror_and_the_monitor() {
     assert!(!crate::window_watch::is_running(), "窗口监听没收");
     assert!(!crate::text_sync::is_enabled(), "文本镜像开关没关");
 }
+
+// ── 主从对调 ─────────────────────────────────────────────────────────────
+
+/// 没在同步时不能对调：这时「主窗口」这个概念还不存在，
+/// 宿主只要改自己的选择，下次 `start_sync` 会按新配置重建一切。
+#[test]
+fn swapping_outside_a_session_is_rejected() {
+    let _guard = ts::serial();
+
+    let err = crate::swap_master(1234).unwrap_err();
+    assert!(err.contains("未启动"), "报错要能映射成 NOT_RUNNING：{err}");
+    assert_no_residue("空转对调");
+}
+
+#[test]
+fn swapping_needs_a_window_that_is_actually_a_slave() {
+    let _guard = ts::serial();
+    let master = ts::popup_window();
+    let slave = ts::popup_window();
+    let bystander = ts::popup_window();
+    let m = ts::hwnd_value(master.0);
+    let s = ts::hwnd_value(slave.0);
+
+    start_sync(config(m, &[s])).unwrap();
+
+    // 一个既不是主窗口、也不在从窗口列表里的窗口
+    let err = crate::swap_master(ts::hwnd_value(bystander.0)).unwrap_err();
+    assert!(err.contains("不是从窗口"), "{err}");
+    assert_eq!(ts::sync_active(), true, "参数错了不该把同步弄停");
+    assert_eq!(crate::MASTER_HWND.load(Ordering::Relaxed), m, "主窗口不该变");
+
+    // 拿主窗口自己去换自己
+    let err = crate::swap_master(m).unwrap_err();
+    assert!(err.contains("已经是主窗口"), "{err}");
+
+    stop_sync().unwrap();
+}
+
+#[test]
+fn swapping_exchanges_roles_without_restarting_the_session() {
+    let _guard = ts::serial();
+    let master = ts::popup_window();
+    let slave1 = ts::popup_window();
+    let slave2 = ts::popup_window();
+    let m = ts::hwnd_value(master.0);
+    let s1 = ts::hwnd_value(slave1.0);
+    let s2 = ts::hwnd_value(slave2.0);
+
+    start_sync(config(m, &[s1, s2])).unwrap();
+    let hooks_before = session::live_hooks();
+
+    crate::swap_master(s1).expect("对调应当成功");
+
+    assert_eq!(
+        crate::MASTER_HWND.load(Ordering::Relaxed),
+        s1,
+        "被选中的从窗口应当成为主窗口"
+    );
+    assert_eq!(
+        ts::slaves(),
+        vec![s2, m],
+        "旧主应当补到列表末尾，其余从窗口的序号不变"
+    );
+    assert_eq!(
+        session::live_hooks(),
+        hooks_before,
+        "对调不该重装钩子（那就是重启了）"
+    );
+    assert!(ts::sync_active(), "对调过程中同步不该停");
+    assert!(
+        crate::text_sync::has_worker(),
+        "文本镜像线程不该被带着一起停掉"
+    );
+
+    stop_sync().unwrap();
+    assert_no_residue("对调后停止");
+}
+
+/// 对调之后**立刻**做一次身份复查 —— 这是最容易漏的一步。
+///
+/// 身份键不重建的话，一秒后的看门狗会把刚升上来的主窗口判成「句柄被系统复用」，
+/// 直接把同步停掉：用户看到的是「切了一下主窗口，同步自己关了」。
+#[test]
+fn the_new_master_survives_an_identity_check_right_after_swapping() {
+    let _guard = ts::serial();
+    let master = ts::popup_window();
+    let slave1 = ts::popup_window();
+    let slave2 = ts::popup_window();
+    let m = ts::hwnd_value(master.0);
+    let s1 = ts::hwnd_value(slave1.0);
+    let s2 = ts::hwnd_value(slave2.0);
+
+    start_sync(config(m, &[s1, s2])).unwrap();
+    crate::swap_master(s1).unwrap();
+
+    ts::verify_now();
+
+    assert!(ts::sync_active(), "身份复查把新主窗口判成了失效");
+    assert_eq!(crate::MASTER_HWND.load(Ordering::Relaxed), s1);
+    assert_eq!(ts::slaves(), vec![s2, m], "从窗口被误剔除了");
+
+    // 反方向再换回来，同样要经得起复查
+    crate::swap_master(m).unwrap();
+    ts::verify_now();
+    assert!(ts::sync_active(), "换回去之后被身份复查停了");
+    assert_eq!(ts::slaves(), vec![s2, s1]);
+
+    stop_sync().unwrap();
+}
+
+/// 切换前必须把还按着的键放掉，否则旧主窗口变从窗口之后就收不到那次抬起。
+#[test]
+fn pressed_keys_are_drained_by_the_swap() {
+    let _guard = ts::serial();
+    let master = ts::popup_window();
+    let slave = ts::popup_window();
+    let m = ts::hwnd_value(master.0);
+    let s = ts::hwnd_value(slave.0);
+
+    start_sync(config(m, &[s])).unwrap();
+    PRESSED.lock().key_down(0x41, 0x1E);
+    PRESSED.lock().button_down(1);
+
+    crate::swap_master(s).unwrap();
+
+    assert!(
+        PRESSED.lock().is_empty(),
+        "切换前按着的键没有被放掉，会永久卡在旧窗口里"
+    );
+
+    stop_sync().unwrap();
+}
+
+/// 反复对调不能把状态搞乱：每换一次，主窗口和从窗口列表都得自洽。
+#[test]
+fn swapping_back_and_forth_stays_consistent() {
+    let _guard = ts::serial();
+    let master = ts::popup_window();
+    let slave = ts::popup_window();
+    let m = ts::hwnd_value(master.0);
+    let s = ts::hwnd_value(slave.0);
+
+    start_sync(config(m, &[s])).unwrap();
+
+    for round in 0..8 {
+        let (from, to) = if round % 2 == 0 { (s, m) } else { (m, s) };
+        crate::swap_master(from).expect("对调应当成功");
+        assert_eq!(
+            crate::MASTER_HWND.load(Ordering::Relaxed),
+            from,
+            "第 {round} 轮：主窗口没换成目标"
+        );
+        assert_eq!(ts::slaves(), vec![to], "第 {round} 轮：从窗口列表不对");
+        ts::verify_now();
+        assert!(ts::sync_active(), "第 {round} 轮：身份复查把同步停了");
+    }
+
+    stop_sync().unwrap();
+    assert_no_residue("反复对调后停止");
+}
+
 
 // ── 停止顺序 ─────────────────────────────────────────────────────────────
 

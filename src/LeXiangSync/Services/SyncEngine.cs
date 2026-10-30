@@ -160,14 +160,44 @@ public sealed partial class SyncEngine : ObservableObject
 
     public void ClearSlaves() => Slaves.Clear();
 
-    /// <summary>把某个从窗口与主窗口互换（原版方案面板里的槽位互换能力）。</summary>
-    public void SwapMaster(long slaveHwnd)
+    /// <summary>
+    /// 把某个从窗口与主窗口对调：它成为主窗口（操作源），原主窗口转为从窗口。
+    /// <para>
+    /// 同步运行中也能切，投递不中断。关键在于**先通知引擎、再改本地选择**：
+    /// 引擎那边要放掉按住的键、重建窗口身份、作废文本基线，一步做完之后再让 UI 跟着变，
+    /// 否则中间那一瞬采集的还是旧窗口，而列表已经是新的。
+    /// </para>
+    /// </summary>
+    /// <returns>是否真的换了。目标不是从窗口、或者引擎拒绝时为 <c>false</c>。</returns>
+    public bool SwapMaster(long slaveHwnd)
     {
+        var oldMaster = Master;
+        if (oldMaster is null) return false;
+
         var slave = Slaves.FirstOrDefault(s => s.Hwnd == slaveHwnd);
-        if (slave is null || Master is null) return;
+        if (slave is null) return false;
+
+        if (IsActive)
+        {
+            try
+            {
+                SyncNative.SwapMaster(slaveHwnd);
+            }
+            catch (NativeException ex)
+            {
+                _log.Add($"主从切换失败: {ex.Message}", LogLevel.Error);
+                return false;
+            }
+        }
+
         Slaves.Remove(slave);
-        Slaves.Add(Master);
+        // 旧主补到末尾：其余从窗口的序号保持不变，用户看到的「从窗口 1 / 2」不会集体跳号
+        Slaves.Add(oldMaster);
         Master = slave;
+
+        _log.Add($"「{slave.Title}」已切为主窗口，「{oldMaster.Title}」转为从窗口", LogLevel.Success);
+        RefreshStatus();
+        return true;
     }
 
     /// <summary>刷新进程列表后剔除已消失的窗口，保持选择与现实一致。</summary>
