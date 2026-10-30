@@ -1,0 +1,27 @@
+# Rust
+core/target/
+**/*.rs.bk
+
+# .NET
+bin/
+obj/
+*.user
+.vs/
+.vscode/
+
+# 产物
+*.dll
+!core/target/**/*.dll
+*.pdb
+*.cache
+*.tmp
+
+# 单文件发布输出（80MB+ 的 exe，现有规则没覆盖到）
+dist/
+
+# 本地工具产生的临时文件 / 截图 / 工程日志，不进仓库
+.workbuddy/
+
+# 其它
+_ReSharper*/
+*.suo

@@ -1,0 +1,97 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+
+    <UseWinUI>true</UseWinUI>
+    <!-- 免 MSIX 打包（unpackaged）+ 自包含 WindowsAppSDK，双击 exe 即可运行 -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
+    <PublishReadyToRun>false</PublishReadyToRun>
+
+    <RootNamespace>LeXiangSync</RootNamespace>
+    <AssemblyName>LeXiangSync</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- exe 文件图标：不设这个的话资源管理器 / 任务栏显示的是系统默认图标。
+         单文件发布也走这条，图标在编译期就嵌进 exe 了。 -->
+    <ApplicationIcon>Assets\appicon.ico</ApplicationIcon>
+
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- 需要 C# 13 的分部属性：CommunityToolkit.Mvvm 推荐的 [ObservableProperty] 写法。
+         显式指定 13.0 时生成器仍按 12 处理，用 preview 才能稳定生成实现部分。 -->
+    <LangVersion>preview</LangVersion>
+    <DefaultLanguage>zh-CN</DefaultLanguage>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!-- Rust 核心位置 -->
+  <PropertyGroup>
+    <RustCoreDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)', '..', '..', 'core'))</RustCoreDir>
+    <RustCoreDll>$(RustCoreDir)target\release\window_sync_core.dll</RustCoreDll>
+    <!-- 设为 true 可跳过 cargo，仅拷贝已存在的 DLL -->
+    <SkipRustCoreBuild Condition="'$(SkipRustCoreBuild)' == ''">false</SkipRustCoreBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260804001" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Manifest Include="$(ApplicationManifest)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 用 Link 固定输出路径，保证运行时能按 Assets\ 取到图标与二维码 -->
+    <None Include="Assets\appicon.ico" Link="Assets\appicon.ico" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Assets\qrcode.png" Link="Assets\qrcode.png" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Assets\Sounds\sync-start.wav" Link="Assets\Sounds\sync-start.wav" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Assets\Sounds\sync-stop.wav" Link="Assets\Sounds\sync-stop.wav" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Assets\Sounds\LICENSE.txt" Link="Assets\Sounds\LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!--
+      单文件发布：dotnet publish -c Release -p:PublishSingleFile=true
+      只在显式开启时生效，平时的 Debug / 普通 Release 构建完全不受影响。
+      这几个开关是 WindowsAppSDK 的硬性要求（Microsoft.WindowsAppSDK.SingleFile.targets 会校验）：
+      EnableMsixTooling 用于生成嵌入式 resources.pri，IncludeAllContentForSelfExtract 让
+      WinRT 的 DLL 能 SxS 重定向，UndockedRegFreeWinRTInitialize 则负责在入口前设置运行时基目录。
+  -->
+  <PropertyGroup Condition="'$(PublishSingleFile)' == 'true'">
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <WindowsAppSdkUndockedRegFreeWinRTInitialize>true</WindowsAppSdkUndockedRegFreeWinRTInitialize>
+    <!-- 压缩后约 80MB，不压缩接近 200MB -->
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <!-- 调试符号嵌进 exe，输出目录就只剩一个文件 -->
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(PublishSingleFile)' == 'true'">
+    <!-- 单文件模式：Rust 核心也进 bundle，否则 exe 旁边还得跟着一个 dll -->
+    <Content Include="$(RustCoreDll)" Link="window_sync_core.dll" CopyToPublishDirectory="PreserveNewest" Condition="Exists('$(RustCoreDll)')" />
+  </ItemGroup>
+
+  <!-- 编译 Rust 核心并把 window_sync_core.dll 放到 exe 同目录 -->
+  <Target Name="EnsureRustCore" BeforeTargets="BeforeBuild" Condition="'$(DesignTimeBuild)' != 'true' AND '$(SkipRustCoreBuild)' != 'true'">
+    <Exec Command="cargo build --release" WorkingDirectory="$(RustCoreDir)" />
+  </Target>
+
+  <Target Name="CopyRustCore" AfterTargets="EnsureRustCore;Build">
+    <Copy SourceFiles="$(RustCoreDll)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('$(RustCoreDll)')" />
+    <Warning Text="未找到 $(RustCoreDll)，请先运行 scripts\build-core.ps1" Condition="!Exists('$(RustCoreDll)')" />
+  </Target>
+
+  <!-- 单文件模式下由上面的 Content 打进 bundle，这里就别再往发布目录丢一份了 -->
+  <Target Name="CopyRustCoreOnPublish" AfterTargets="Publish" Condition="'$(PublishSingleFile)' != 'true'">
+    <Copy SourceFiles="$(RustCoreDll)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" Condition="Exists('$(RustCoreDll)')" />
+  </Target>
+
+</Project>

@@ -1,0 +1,97 @@
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!--
+        底部条「◉ 鼠标 / ◉ 键盘 …」开关的模板。
+        ────────────────────────────────────────────────────────────────
+        放在独立文件里是有原因的：WinUI 的 XAML 编译器把同一个 XAML 文档里所有
+        ControlTemplate 的 VisualState 名称算在同一个作用域，两个模板都写
+        `CheckStates`/`CommonStates` 会直接报 WMC0047 重名。拆成独立文件后各自
+        是独立文档，名称作用域互不影响。
+    -->
+    <ControlTemplate x:Key="LxSyncChipTemplate" TargetType="ToggleButton">
+        <Border
+            x:Name="ChipRoot"
+            Padding="{TemplateBinding Padding}"
+            Background="{TemplateBinding Background}"
+            BorderBrush="{TemplateBinding BorderBrush}"
+            BorderThickness="{TemplateBinding BorderThickness}"
+            CornerRadius="{TemplateBinding CornerRadius}">
+            <VisualStateManager.VisualStateGroups>
+                        <VisualStateGroup x:Name="CheckStates">
+                            <VisualState x:Name="Checked">
+                                <Storyboard>
+                                    <DoubleAnimation
+                                        Duration="0"
+                                        Storyboard.TargetName="ChipDot"
+                                        Storyboard.TargetProperty="Opacity"
+                                        To="1" />
+                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ChipRing" Storyboard.TargetProperty="Stroke">
+                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource LxAccentBrush}" />
+                                    </ObjectAnimationUsingKeyFrames>
+                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ChipRoot" Storyboard.TargetProperty="BorderBrush">
+                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource LxAccentBrush}" />
+                                    </ObjectAnimationUsingKeyFrames>
+                                </Storyboard>
+                            </VisualState>
+                            <VisualState x:Name="Unchecked" />
+                            <VisualState x:Name="Indeterminate" />
+                        </VisualStateGroup>
+            
+                        <VisualStateGroup x:Name="CommonStates">
+                            <VisualState x:Name="Normal" />
+                            <VisualState x:Name="PointerOver">
+                                <Storyboard>
+                                    <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ChipRoot" Storyboard.TargetProperty="Background">
+                                        <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource LxRowHoverBrush}" />
+                                    </ObjectAnimationUsingKeyFrames>
+                                </Storyboard>
+                            </VisualState>
+                            <VisualState x:Name="Pressed">
+                                <Storyboard>
+                                    <DoubleAnimation
+                                        Duration="0"
+                                        Storyboard.TargetName="ChipRoot"
+                                        Storyboard.TargetProperty="Opacity"
+                                        To="0.7" />
+                                </Storyboard>
+                            </VisualState>
+                            <VisualState x:Name="Disabled">
+                                <Storyboard>
+                                    <DoubleAnimation
+                                        Duration="0"
+                                        Storyboard.TargetName="ChipRoot"
+                                        Storyboard.TargetProperty="Opacity"
+                                        To="0.4" />
+                                </Storyboard>
+                            </VisualState>
+                        </VisualStateGroup>
+                    </VisualStateManager.VisualStateGroups>
+
+            <StackPanel Orientation="Horizontal" Spacing="6">
+                <Grid
+                    Width="10"
+                    Height="10"
+                    VerticalAlignment="Center">
+                    <Ellipse
+                        x:Name="ChipRing"
+                        Stroke="{ThemeResource LxTextTertiaryBrush}"
+                        StrokeThickness="1.4" />
+                    <Ellipse
+                        x:Name="ChipDot"
+                        Width="4"
+                        Height="4"
+                        Fill="{ThemeResource LxAccentBrush}"
+                        Opacity="0" />
+                </Grid>
+                <ContentPresenter
+                    VerticalAlignment="Center"
+                    Content="{TemplateBinding Content}"
+                    FontSize="{TemplateBinding FontSize}"
+                    Foreground="{TemplateBinding Foreground}" />
+            </StackPanel>
+        </Border>
+
+    </ControlTemplate>
+</ResourceDictionary>

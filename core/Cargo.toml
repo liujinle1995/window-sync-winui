@@ -1,0 +1,36 @@
+[package]
+name = "window-sync-core"
+version = "0.8.0"
+edition = "2021"
+description = "乐享同步操作 —— 核心同步引擎（Win32 窗口枚举 / 全局钩子 / 输入注入 / 进程管理）"
+license = "MIT"
+
+[lib]
+name = "window_sync_core"
+# cdylib  : 供 WinUI 3 前端 P/Invoke
+# rlib    : 供 Rust 侧测试
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+once_cell  = "1"
+parking_lot = "0.12"
+windows    = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+] }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+panic         = "abort"
+strip         = true
