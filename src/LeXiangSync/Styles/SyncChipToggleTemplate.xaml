@@ -1,0 +1,105 @@
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!--
+        迷你条上的启停按钮。原来它是个普通 Button，点了以后唯一的变化是文字
+        「开始同步 → 停止同步」，颜色恒定、按下也没有反应 —— 隔着一段距离根本看不出
+        现在是开还是关，这就是「没有正向反馈」。
+        ────────────────────────────────────────────────────────────────
+        现在按状态换外观：
+            Unchecked（待启动）= 普通背景色 + 1px 描边 + 主文字色，和「置顶」同档，
+                                 不抢视线，表示「还没开始」
+            Checked  （同步中）= 强调蓝实心 + 白字，一眼能看出正在跑
+        再叠两个通用状态：悬停略透、按下更透。离开状态时 Windows 会把 Storyboard
+        撤掉，属性自动回到模板绑定的基础值，所以 Normal 不需要写 storyboard。
+
+        注意 Foreground 也必须跟着切：蓝底上用主文字色会发灰，普通底上用白色则看不见。
+        所以内容用纯字符串（让 ContentPresenter 自己生成 TextBlock 吃这里的 Foreground），
+        别在里面塞 <TextBlock Foreground="White"/> —— 那样状态切换管不到它。
+
+        独立成文件的原因见 ChipToggleTemplate.xaml 顶部注释：同一个 XAML 文档里
+        多个 ControlTemplate 的 VisualState 名称会撞车（WMC0047）。
+    -->
+    <ControlTemplate x:Key="LxSyncChipTemplate" TargetType="ToggleButton">
+        <Border
+            x:Name="ChipRoot"
+            Padding="{TemplateBinding Padding}"
+            Background="{TemplateBinding Background}"
+            BorderBrush="{TemplateBinding BorderBrush}"
+            BorderThickness="{TemplateBinding BorderThickness}"
+            CornerRadius="{TemplateBinding CornerRadius}">
+            <VisualStateManager.VisualStateGroups>
+                <VisualStateGroup x:Name="CheckStates">
+                    <VisualState x:Name="Checked">
+                        <Storyboard>
+                            <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ChipRoot" Storyboard.TargetProperty="Background">
+                                <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource LxAccentBrush}" />
+                            </ObjectAnimationUsingKeyFrames>
+                            <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ChipRoot" Storyboard.TargetProperty="BorderBrush">
+                                <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource LxAccentBrush}" />
+                            </ObjectAnimationUsingKeyFrames>
+                            <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ChipContent" Storyboard.TargetProperty="Foreground">
+                                <DiscreteObjectKeyFrame KeyTime="0" Value="#FFFFFF" />
+                            </ObjectAnimationUsingKeyFrames>
+                        </Storyboard>
+                    </VisualState>
+                    <VisualState x:Name="Unchecked">
+                        <Storyboard>
+                            <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ChipRoot" Storyboard.TargetProperty="Background">
+                                <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource LxSurfaceRaisedBrush}" />
+                            </ObjectAnimationUsingKeyFrames>
+                            <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ChipRoot" Storyboard.TargetProperty="BorderBrush">
+                                <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource LxStrokeBrush}" />
+                            </ObjectAnimationUsingKeyFrames>
+                            <ObjectAnimationUsingKeyFrames Storyboard.TargetName="ChipContent" Storyboard.TargetProperty="Foreground">
+                                <DiscreteObjectKeyFrame KeyTime="0" Value="{ThemeResource LxTextPrimaryBrush}" />
+                            </ObjectAnimationUsingKeyFrames>
+                        </Storyboard>
+                    </VisualState>
+                    <VisualState x:Name="Indeterminate" />
+                </VisualStateGroup>
+
+                <VisualStateGroup x:Name="CommonStates">
+                    <VisualState x:Name="Normal" />
+                    <VisualState x:Name="PointerOver">
+                        <Storyboard>
+                            <DoubleAnimation
+                                Duration="0"
+                                Storyboard.TargetName="ChipRoot"
+                                Storyboard.TargetProperty="Opacity"
+                                To="0.88" />
+                        </Storyboard>
+                    </VisualState>
+                    <!-- 按下：明显压暗一档，点下去手上有回馈 -->
+                    <VisualState x:Name="Pressed">
+                        <Storyboard>
+                            <DoubleAnimation
+                                Duration="0"
+                                Storyboard.TargetName="ChipRoot"
+                                Storyboard.TargetProperty="Opacity"
+                                To="0.68" />
+                        </Storyboard>
+                    </VisualState>
+                    <VisualState x:Name="Disabled">
+                        <Storyboard>
+                            <DoubleAnimation
+                                Duration="0"
+                                Storyboard.TargetName="ChipRoot"
+                                Storyboard.TargetProperty="Opacity"
+                                To="0.4" />
+                        </Storyboard>
+                    </VisualState>
+                </VisualStateGroup>
+            </VisualStateManager.VisualStateGroups>
+
+            <ContentPresenter
+                x:Name="ChipContent"
+                HorizontalContentAlignment="Center"
+                VerticalAlignment="Center"
+                Content="{TemplateBinding Content}"
+                FontSize="{TemplateBinding FontSize}"
+                Foreground="{TemplateBinding Foreground}" />
+        </Border>
+    </ControlTemplate>
+</ResourceDictionary>

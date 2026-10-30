@@ -7,6 +7,7 @@
         <ResourceDictionary Source="ms-appx:///Styles/ChipToggleTemplate.xaml" />
         <ResourceDictionary Source="ms-appx:///Styles/SegmentToggleTemplate.xaml" />
         <ResourceDictionary Source="ms-appx:///Styles/AccentChipToggleTemplate.xaml" />
+        <ResourceDictionary Source="ms-appx:///Styles/SyncChipToggleTemplate.xaml" />
     </ResourceDictionary.MergedDictionaries>
 
     <!--
@@ -42,8 +43,12 @@
             <SolidColorBrush x:Key="LxTextSecondaryBrush" Color="#9B9B9B" />
             <SolidColorBrush x:Key="LxTextTertiaryBrush" Color="#767676" />
 
-            <!-- 主窗口用暖金、从窗口用浅蓝：设计稿靠色相区分主从，不靠色块 -->
-            <SolidColorBrush x:Key="LxMasterBrush" Color="#E0C07A" />
+            <!--
+                主窗口标签用红、从窗口标签用浅蓝：靠色相区分主从，不靠色块。
+                主窗口这一处原先是暖金（#E0C07A），和行底色 LxMasterSoftBrush 同为暖色，
+                凑在一起反而糊成一片；改成红之后「源」这个身份一眼就能挑出来。
+            -->
+            <SolidColorBrush x:Key="LxMasterBrush" Color="#FF7B72" />
             <SolidColorBrush x:Key="LxMasterSoftBrush" Color="#2E2A1C" />
             <SolidColorBrush x:Key="LxSlaveBrush" Color="#8FBEEB" />
         </ResourceDictionary>
@@ -73,7 +78,7 @@
             <SolidColorBrush x:Key="LxTextSecondaryBrush" Color="#666666" />
             <SolidColorBrush x:Key="LxTextTertiaryBrush" Color="#8A8A8A" />
 
-            <SolidColorBrush x:Key="LxMasterBrush" Color="#8A6A16" />
+            <SolidColorBrush x:Key="LxMasterBrush" Color="#CF222E" />
             <SolidColorBrush x:Key="LxMasterSoftBrush" Color="#FBF6E6" />
             <SolidColorBrush x:Key="LxSlaveBrush" Color="#1F6FB2" />
         </ResourceDictionary>
@@ -451,7 +456,7 @@
     <!-- ══ 迷你条（折叠态） ════════════════════════════════════════════════ -->
     <!--
         设计稿的迷你窗口是一根「独立浮起的长条」：1px 描边 + 圆角，
-        左侧徽标 +「乐享同步 · 迷你」，右侧「置顶 / 同步 / 还原」三个按钮。
+        左侧徽标 +「乐享同步 · 迷你」，右侧「置顶 / 同步 / 仅排版 / 还原 / 最小化 / 关闭」。
         它没有系统标题栏按钮，所以折叠时要把窗口边框与标题栏一起关掉。
     -->
     <Style x:Key="LxCompactBarStyle" TargetType="Border">
@@ -472,5 +477,23 @@
         <Setter Property="FontSize" Value="{StaticResource LxFontCaption}" />
         <Setter Property="Foreground" Value="{ThemeResource LxTextPrimaryBrush}" />
         <Setter Property="Template" Value="{StaticResource LxAccentChipTemplate}" />
+    </Style>
+
+    <!--
+        迷你条的启停按钮。两种状态：待启动 = 普通背景色（与「置顶」同档，不抢视线），
+        同步中 = 强调蓝实心 + 白字。颜色与文字色都由模板的 Checked / Unchecked 决定
+        （见 SyncChipToggleTemplate.xaml），这里只放未选中时的基础值。
+    -->
+    <Style x:Key="LxCompactSyncStyle" TargetType="ToggleButton">
+        <Setter Property="Background" Value="{ThemeResource LxSurfaceRaisedBrush}" />
+        <Setter Property="BorderBrush" Value="{ThemeResource LxStrokeBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="6" />
+        <Setter Property="Padding" Value="11,0" />
+        <Setter Property="MinWidth" Value="0" />
+        <Setter Property="Height" Value="30" />
+        <Setter Property="FontSize" Value="{StaticResource LxFontCaption}" />
+        <Setter Property="Foreground" Value="{ThemeResource LxTextPrimaryBrush}" />
+        <Setter Property="Template" Value="{StaticResource LxSyncChipTemplate}" />
     </Style>
 </ResourceDictionary>

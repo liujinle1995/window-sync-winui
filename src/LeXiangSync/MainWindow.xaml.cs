@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using LeXiangSync.Helpers;
@@ -85,6 +86,10 @@ public sealed partial class MainWindow : Window
         // 删除组要弹确认框（组里的号会一起没），所以把 XamlRoot 的取法一并传进去
         _launch = new LaunchViewModel(store.Launch, logs, store, handle, () => ContentFrame.XamlRoot);
         _launch.Finished += OnMultiLaunchFinished;
+
+        // 迷你条上的「仅排版」跟启动流程抢同一份窗口清单，所以要跟着它的忙闲走：
+        // 完整界面那边正在「一键启动」时，这条按钮必须是灰的，否则两边会同时去摆窗口。
+        _launch.PropertyChanged += OnLaunchPropertyChanged;
         _pages["launch"] = new LaunchPage(_launch);
 
         // 方案页需要两样窗口相关能力：弹对话框用的 XamlRoot、按当前选择构造方案的回调
@@ -406,6 +411,55 @@ public sealed partial class MainWindow : Window
     /// 与点标题栏的关闭按钮行为完全一致。
     /// </summary>
     private void OnCompactCloseClick(object sender, RoutedEventArgs e) => Close();
+
+    /// <summary>
+    /// 迷你条上的启停。命令照旧走 ViewModel，按完再拿引擎的真实状态回写一次 IsChecked ——
+    /// ToggleButton 被点时会先自己把勾选翻过去，万一命令没生效（选项非法、核心报错），
+    /// 按钮就会停在一个骗人的颜色上，比没有反馈更糟。
+    /// </summary>
+    private void OnCompactSyncClick(object sender, RoutedEventArgs e)
+    {
+        ViewModel.ToggleSyncCommand.Execute(null);
+        CompactSyncToggle.IsChecked = ViewModel.Engine.IsActive;
+    }
+
+    /// <summary>
+    /// 迷你条上的「仅排版」：不还原完整界面，直接按当前组的排版基准把已打开的窗口重摆一遍。
+    /// 逻辑完全复用启动页那条 <c>ArrangeCommand</c>（它自己会 Persist、报进度、写日志），
+    /// 这里只补两件事：忙的时候挡一下，以及按钮自己的「排版中」反馈（见 UpdateCompactArrangeState）。
+    /// </summary>
+    private async void OnCompactArrangeClick(object sender, RoutedEventArgs e)
+    {
+        if (!_launch.ArrangeCommand.CanExecute(null))
+        {
+            App.Logs.Add("排版没开始：上一轮启动或排版还在跑，等它结束再点", LogLevel.Warning);
+            return;
+        }
+
+        try
+        {
+            // 命令内部的 IsRunning 一变，OnLaunchPropertyChanged 就会把按钮切成「排版中」，
+            // 所以这里不用自己改文字，等它跑完即可。
+            await _launch.ArrangeCommand.ExecuteAsync(null);
+        }
+        catch (Exception ex)
+        {
+            App.Logs.Add(ex, "排版失败：");
+        }
+    }
+
+    /// <summary>把启动流程的忙闲同步到迷你条的「仅排版」按钮上。</summary>
+    private void OnLaunchPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(LaunchViewModel.IsRunning)) UpdateCompactArrangeState();
+    }
+
+    private void UpdateCompactArrangeState()
+    {
+        var busy = _launch.IsRunning;
+        CompactArrangeButton.IsEnabled = !busy;
+        CompactArrangeText.Text = busy ? "排版中" : "仅排版";
+    }
 
     /// <summary>
     /// 折叠成一枚桌面长条：整块界面换成 <c>CompactBar</c>，窗口缩到只够放它。

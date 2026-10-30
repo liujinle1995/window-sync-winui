@@ -498,13 +498,39 @@
                         </StackPanel>
                     </ToggleButton>
 
+                    <!--
+                        启停：用 ToggleButton 而不是 Button。Button 点了以后只有文字在
+                        「开始同步 / 停止同步」之间跳，颜色恒定，条上根本看不出现在开没开。
+                        IsChecked 跟随引擎真实状态：待启动 = 普通背景色，同步中 = 蓝实心，
+                        见 LxSyncChipTemplate。
+
+                        内容用纯字符串而不是内嵌 TextBlock：文字色要随状态切换（蓝底白字 /
+                        浅底主文字色），只有交给 ContentPresenter 才吃得下模板里的 Foreground。
+                    -->
+                    <ToggleButton
+                        x:Name="CompactSyncToggle"
+                        Click="OnCompactSyncClick"
+                        Content="{x:Bind ViewModel.ToggleButtonText, Mode=OneWay}"
+                        IsChecked="{x:Bind ViewModel.IsActive, Mode=OneWay}"
+                        Style="{StaticResource LxCompactSyncStyle}"
+                        ToolTipService.ToolTip="开始 / 停止同步（快捷键 Ctrl + Alt + S）" />
+
+                    <!--
+                        仅排版：等同于启动页的「仅排布窗口」——按当前组的排版基准把已经
+                        开着的窗口重新摆一遍，不启动任何进程。放在条上是为了多开时不必
+                        先把完整界面还原回来；忙碌时（启动 / 排版中）由代码禁用。
+                    -->
                     <Button
+                        x:Name="CompactArrangeButton"
                         Height="30"
                         Padding="12,0"
-                        Command="{x:Bind ViewModel.ToggleSyncCommand}"
-                        Style="{StaticResource LxPrimaryButtonStyle}"
-                        ToolTipService.ToolTip="快捷键 Ctrl + Alt + S">
-                        <TextBlock FontSize="11.5" Text="{x:Bind ViewModel.ToggleButtonText, Mode=OneWay}" />
+                        Click="OnCompactArrangeClick"
+                        Style="{StaticResource LxSecondaryButtonStyle}"
+                        ToolTipService.ToolTip="只重新摆放已打开的窗口，不启动进程（不还原完整界面）">
+                        <TextBlock
+                            x:Name="CompactArrangeText"
+                            FontSize="11.5"
+                            Text="仅排版" />
                     </Button>
 
                     <Button

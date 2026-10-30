@@ -66,6 +66,12 @@ public sealed partial class MainViewModel : ObservableObject
 
     public string ToggleButtonText => Engine.IsActive ? "停止同步" : "开始同步";
 
+    /// <summary>
+    /// 是否正在同步。迷你条上的启停按钮用它决定实心底色（未同步蓝、同步中红），
+    /// 所以它必须跟着引擎走 —— 热键、托盘、主窗口按钮三处都能改这个状态。
+    /// </summary>
+    public bool IsActive => Engine.IsActive;
+
     /// <summary>标题栏版本胶囊：`v1.0.0 · 核心 0.9.4`。</summary>
     public string VersionText => $"v1.0.0 · 核心 {Engine.CoreVersion}";
 
@@ -94,6 +100,7 @@ public sealed partial class MainViewModel : ObservableObject
             if (e.PropertyName is nameof(SyncEngine.IsActive) or nameof(SyncEngine.Status))
             {
                 OnPropertyChanged(nameof(ToggleButtonText));
+                OnPropertyChanged(nameof(IsActive));
                 OnPropertyChanged(nameof(StatusText));
                 OnPropertyChanged(nameof(StatusBrush));
             }
