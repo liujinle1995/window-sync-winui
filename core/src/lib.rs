@@ -4,14 +4,15 @@
 //!   - `WM_MOUSEWHEEL`：**屏幕**坐标（lParam 的约定，塞客户区坐标会偏）
 //!   - 主/从窗口客户区尺寸不同时，按客户区比例换算，保证落在同一个相对位置
 //! 键盘同步：PostMessageA WM_KEYDOWN/WM_KEYUP
-//! 中文同步：见 `text_mirror` 模块 —— 读主窗口焦点控件文本做 diff，再用 WM_CHAR 投递给从窗口
+//! 中文同步：见 `text_sync` 模块 —— 绑定焦点控件身份后读文本做单区间差分，
+//! 再按「末尾增量 / 整段重写」投递给每个从窗口，并各自校验
 //!
 //! 本文件与 Tauri 版 `src-tauri/src/lib.rs` 逻辑基本一致，仅去掉了 `#[tauri::command]`
 //! 与 AppHandle，状态推送改由 `ffi` 层注册的 C 回调完成。
 
 pub mod event_bus;
 pub mod ffi;
-pub mod text_mirror;
+pub mod text_sync;
 
 use event_bus::{EventBus, Pos, PressedState, Reliable, Task, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 
@@ -652,7 +653,7 @@ pub fn start_sync(config: SyncConfig) -> Result<String, String> {
     }
 
     SYNC_ACTIVE.store(true, Ordering::Relaxed);
-    text_mirror::set_enabled(config.text_mirror);
+    text_sync::set_enabled(config.text_mirror);
     log("同步已启动");
     emit_status();
     Ok("同步已启动".into())
@@ -663,8 +664,9 @@ pub fn stop_sync() -> Result<String, String> {
     // 反过来的话，补抬起之后仍可能有排队的 KeyDown 落地，从窗口照样卡键。
     remove_hooks();
     SYNC_ACTIVE.store(false, Ordering::Relaxed);
-    text_mirror::set_enabled(false);
-    text_mirror::shutdown();
+    text_sync::set_enabled(false);
+    // join 在 shutdown 里：文本线程退出前会把手上那一拍做完，不会留半截状态
+    text_sync::shutdown();
 
     let (keys, buttons) = PRESSED.lock().drain();
     let has_pressed = !keys.is_empty() || buttons != 0;
@@ -702,16 +704,21 @@ pub fn get_sync_status() -> SyncStatus {
         sync_mouse:     SYNC_MOUSE.load(Ordering::Relaxed),
         sync_keyboard:  SYNC_KEYBOARD.load(Ordering::Relaxed),
         sync_clipboard: SYNC_CLIPBOARD.load(Ordering::Relaxed),
-        text_mirror:    text_mirror::is_enabled(),
+        text_mirror:    text_sync::is_enabled(),
     }
 }
 
-/// 供 `text_mirror` 取用当前的主窗口与从窗口列表。
-pub(crate) fn mirror_targets() -> Option<(i64, Vec<i64>)> {
+/// 供 `text_sync` 取用当前的主窗口与从窗口列表。
+///
+/// 从窗口列表用 `live_slaves()` 过滤掉的已销毁窗口 —— 否则文本同步每拍都会去
+/// `SendMessage` 一个不存在的句柄，白等超时。
+pub(crate) fn text_sync_targets() -> Option<(HWND, Vec<HWND>)> {
     if !SYNC_ACTIVE.load(Ordering::Relaxed) { return None; }
     let master = MASTER_HWND.load(Ordering::Relaxed);
     if master == 0 { return None; }
-    Some((master, SLAVES.lock().clone()))
+    let slaves = live_slaves();
+    if slaves.is_empty() { return None; }
+    Some((HWND(master as *mut _), slaves))
 }
 
 pub fn update_sync_options(sync_mouse: bool, sync_keyboard: bool, sync_clipboard: bool) -> Result<(), String> {
@@ -796,6 +803,13 @@ unsafe extern "system" fn kb_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT 
         if GetForegroundWindow() == master {
             let n  = wp.0 as u32;
             let vk = kb.vkCode;
+
+            // 任何一个键都当作「文本可能变了」的信号去唤醒文本同步：
+            // 它会立刻采样一次，比固定轮询快 0~120ms。可打印键顺便计入
+            // 「疑似自绘输入框」的嫌疑统计（转发了按键但文本从不变化）。
+            if n == WM_KEYDOWN || n == WM_SYSKEYDOWN {
+                text_sync::note_key(vk);
+            }
 
             // 跟踪 Ctrl 键
             if vk == 0x11 {  // VK_CONTROL

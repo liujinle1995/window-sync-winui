@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use crate::{
     get_processes, get_sync_status, get_windows, focus_window, kill_process, kill_process_by_name,
-    launch_app, start_sync, stop_sync, text_mirror, update_sync_options, LogCb, StatusCb, SyncConfig,
+    launch_app, start_sync, stop_sync, text_sync, update_sync_options, LogCb, StatusCb, SyncConfig,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -146,7 +146,9 @@ pub unsafe extern "C" fn wsync_update_sync_options(options_json: *const c_char) 
     })
 }
 
-/// 开关文本镜像（中文 / 粘贴内容同步）。参数 `{"enabled":true}`
+/// 开关文本同步（中文 / 粘贴内容同步）。参数 `{"enabled":true}`
+///
+/// 入口名保持不变（`wsync_set_text_mirror`），宿主 UI 不用改。
 #[no_mangle]
 pub unsafe extern "C" fn wsync_set_text_mirror(args_json: *const c_char) -> *mut c_char {
     guard(|| {
@@ -157,7 +159,7 @@ pub unsafe extern "C" fn wsync_set_text_mirror(args_json: *const c_char) -> *mut
         }
         match parse::<Args>(args_json) {
             Ok(a) => {
-                text_mirror::set_enabled(a.enabled);
+                text_sync::set_enabled(a.enabled);
                 ok(&true)
             }
             Err(e) => err(e),
