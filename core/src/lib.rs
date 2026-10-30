@@ -430,16 +430,14 @@ fn client_size(h: HWND) -> Option<(i32, i32)> {
 /// 保证「拿不到尺寸」也不会把坐标算成负数或者 0 导致全部点左上角。
 #[inline]
 fn map_client_point(x: i32, y: i32, src_w: i32, src_h: i32, target: HWND) -> (i32, i32) {
-    {
-        let Some((dst_w, dst_h)) = client_size(target) else { return (x, y) };
-        if src_w <= 0 || src_h <= 0 { return (x, y); }
-        if src_w == dst_w && src_h == dst_h { return (x, y); }
+    let Some((dst_w, dst_h)) = client_size(target) else { return (x, y) };
+    if src_w <= 0 || src_h <= 0 { return (x, y); }
+    if src_w == dst_w && src_h == dst_h { return (x, y); }
 
-        let nx = (x as f64 / src_w as f64 * dst_w as f64).round() as i32;
-        let ny = (y as f64 / src_h as f64 * dst_h as f64).round() as i32;
-        // 夹在客户区内：比例换算后可能因为取整落在右/下边界外一像素
-        (nx.clamp(0, dst_w - 1), ny.clamp(0, dst_h - 1))
-    }
+    let nx = (x as f64 / src_w as f64 * dst_w as f64).round() as i32;
+    let ny = (y as f64 / src_h as f64 * dst_h as f64).round() as i32;
+    // 夹在客户区内：比例换算后可能因为取整落在右/下边界外一像素
+    (nx.clamp(0, dst_w - 1), ny.clamp(0, dst_h - 1))
 }
 
 // ── start_sync ────────────────────────────────────────────────────────────
